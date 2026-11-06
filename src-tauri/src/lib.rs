@@ -1,14 +1,20 @@
+use orbit_core::{
+    AuditLog, CommandRequest, CommandResponse, CommandStatus, ScreenshotRequest, command_catalog,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 use sysinfo::{Components, System};
-#[cfg(target_os = "windows")]
 use tauri::Manager;
 use tauri::{
-    AppHandle, Emitter, PhysicalPosition, WebviewWindow, Window,
+    AppHandle, Emitter, PhysicalPosition, PhysicalSize, WebviewWindow, Window,
     menu::{ContextMenu, Menu, MenuItem},
 };
 use tauri_plugin_autostart::ManagerExt;
+use xcap::Monitor;
+
+mod screenshot;
 
 const FLOATING_SIZE: (f64, f64) = (104.0, 104.0);
 const SIDE_SIZE: (f64, f64) = (54.0, 132.0);
@@ -74,13 +80,35 @@ enum PermissionState {
 
 #[tauri::command]
 fn complete_first_run_setup(app: AppHandle) -> Result<SetupResult, String> {
+    set_autostart_enabled(app, true)
+}
+
+#[tauri::command]
+fn get_setup_status(app: AppHandle) -> Result<SetupResult, String> {
+    setup_result(&app)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<SetupResult, String> {
     let autostart = app.autolaunch();
-    autostart.enable().map_err(|error| error.to_string())?;
-    let autostart_configured = autostart.is_enabled().map_err(|error| error.to_string())?;
-    if !autostart_configured {
-        return Err("登录启动项注册后仍处于关闭状态。".to_string());
+    if enabled {
+        autostart.enable().map_err(|error| error.to_string())?;
+    } else {
+        autostart.disable().map_err(|error| error.to_string())?;
     }
 
+    let result = setup_result(&app)?;
+    if result.autostart_configured != enabled {
+        return Err(if enabled {
+            "登录启动项注册后仍处于关闭状态。".to_string()
+        } else {
+            "登录启动项已关闭，但状态检查仍显示启用。".to_string()
+        });
+    }
+    Ok(result)
+}
+
+fn setup_result(app: &AppHandle) -> Result<SetupResult, String> {
     let permissions = [
         ("screen-capture", PermissionState::Unknown),
         ("accessibility-input", PermissionState::Unknown),
@@ -88,11 +116,193 @@ fn complete_first_run_setup(app: AppHandle) -> Result<SetupResult, String> {
     .into_iter()
     .map(|(id, state)| (id.to_string(), state))
     .collect();
+    let autostart_configured = app
+        .autolaunch()
+        .is_enabled()
+        .map_err(|error| error.to_string())?;
 
     Ok(SetupResult {
         permissions,
         autostart_configured,
     })
+}
+
+#[tauri::command]
+fn get_command_catalog() -> Result<Vec<orbit_core::CommandSpec>, String> {
+    command_catalog().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn execute_command(
+    audit: tauri::State<'_, AuditLog>,
+    request: CommandRequest,
+) -> Result<CommandResponse, String> {
+    execute_request(audit.inner().clone(), request).await
+}
+
+async fn execute_request(
+    audit: AuditLog,
+    request: CommandRequest,
+) -> Result<CommandResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let command_id = request.command_id.clone();
+        let result = if command_id == "screenshot.capture" {
+            serde_json::from_value::<ScreenshotRequest>(request.params.clone())
+                .map_err(|error| error.to_string())
+                .and_then(screenshot::capture_to_clipboard)
+        } else {
+            Err(format!("未知命令：{command_id}"))
+        };
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let status = if result.is_ok() {
+            CommandStatus::Ok
+        } else {
+            CommandStatus::Error
+        };
+        audit
+            .record(&command_id, &request.params, status, duration_ms)
+            .map_err(|error| format!("命令执行结果无法写入审计日志：{error}"))?;
+
+        let (data, error) = match result {
+            Ok(data) => (Some(data), None),
+            Err(error) => (None, Some(error)),
+        };
+        Ok(CommandResponse {
+            command_id,
+            status,
+            data,
+            error,
+            duration_ms,
+        })
+    })
+    .await
+    .map_err(|error| format!("命令工作线程异常退出：{error}"))?
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegionSelectionStart {
+    monitor_id: u32,
+}
+
+#[tauri::command]
+fn start_region_selection(
+    app: AppHandle,
+    state: tauri::State<'_, OverlayState>,
+) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
+    let selection = app
+        .get_webview_window("selection")
+        .ok_or_else(|| "找不到区域截图窗口。".to_string())?;
+    let monitor = main
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or(main.primary_monitor().map_err(|error| error.to_string())?)
+        .ok_or_else(|| "无法确定区域截图所在的显示器。".to_string())?;
+    let position = monitor.position();
+    let size = monitor.size();
+    let capture_monitor = Monitor::all()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|candidate| {
+            candidate.x().ok() == Some(position.x)
+                && candidate.y().ok() == Some(position.y)
+                && candidate.width().ok() == Some(size.width)
+                && candidate.height().ok() == Some(size.height)
+        })
+        .ok_or_else(|| "无法将窗口显示器映射到截图设备。".to_string())?;
+    let monitor_id = capture_monitor.id().map_err(|error| error.to_string())?;
+
+    selection
+        .set_size(PhysicalSize::new(size.width, size.height))
+        .map_err(|error| error.to_string())?;
+    selection
+        .set_position(PhysicalPosition::new(position.x, position.y))
+        .map_err(|error| error.to_string())?;
+    selection
+        .emit(
+            "region-selection-start",
+            RegionSelectionStart { monitor_id },
+        )
+        .map_err(|error| error.to_string())?;
+
+    main.hide().map_err(|error| error.to_string())?;
+    if let Err(error) = selection.show() {
+        let _ = main.show();
+        return Err(error.to_string());
+    }
+    if let Err(error) = selection.set_focus() {
+        let _ = selection.hide();
+        return match restore_main_overlay(&app, state.inner()) {
+            Ok(()) => Err(error.to_string()),
+            Err(restore_error) => Err(format!(
+                "无法聚焦区域截图窗口：{error}；恢复 Orbit 主窗口失败：{restore_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn restore_main_overlay(app: &AppHandle, state: &OverlayState) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
+    let layout = *state.0.lock().map_err(|error| error.to_string())?;
+    set_overlay_layout(&main, layout.dock, layout.expanded)?;
+    main.show().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn finish_region_selection(
+    app: AppHandle,
+    audit: tauri::State<'_, AuditLog>,
+    state: tauri::State<'_, OverlayState>,
+    monitor_id: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<CommandResponse, String> {
+    let selection = app
+        .get_webview_window("selection")
+        .ok_or_else(|| "找不到区域截图窗口。".to_string())?;
+    selection.hide().map_err(|error| error.to_string())?;
+    let request = CommandRequest {
+        command_id: "screenshot.capture".to_string(),
+        params: serde_json::json!({
+            "mode": "region",
+            "monitorId": monitor_id,
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height
+        }),
+    };
+    let result = execute_request(audit.inner().clone(), request).await;
+    let restore = restore_main_overlay(&app, state.inner());
+    match (result, restore) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("截图已处理，但无法恢复 Orbit 主窗口：{error}")),
+        (Err(capture_error), Err(restore_error)) => Err(format!(
+            "{capture_error}；恢复 Orbit 主窗口失败：{restore_error}"
+        )),
+    }
+}
+
+#[tauri::command]
+fn cancel_region_selection(
+    app: AppHandle,
+    state: tauri::State<'_, OverlayState>,
+) -> Result<(), String> {
+    let selection = app
+        .get_webview_window("selection")
+        .ok_or_else(|| "找不到区域截图窗口。".to_string())?;
+    selection.hide().map_err(|error| error.to_string())?;
+    restore_main_overlay(&app, state.inner())
 }
 
 fn monitor_bounds(window: &WebviewWindow) -> Result<(i32, i32, i32, i32), String> {
@@ -296,6 +506,13 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             complete_first_run_setup,
+            get_setup_status,
+            set_autostart_enabled,
+            get_command_catalog,
+            execute_command,
+            start_region_selection,
+            finish_region_selection,
+            cancel_region_selection,
             dock_overlay,
             set_overlay_open,
             show_orb_context_menu
@@ -310,6 +527,11 @@ pub fn run() {
             _ => {}
         })
         .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&app_data_dir)?;
+            let audit = AuditLog::open(app_data_dir.join("orbit.db"))?;
+            app.manage(audit);
+
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut system = System::new();
