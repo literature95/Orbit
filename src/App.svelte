@@ -1,132 +1,289 @@
 <script lang="ts">
   import { invoke, isTauri } from '@tauri-apps/api/core';
-  import { canFinishSetup, requiredPermissions, type PermissionState } from './lib/setup';
+  import { listen } from '@tauri-apps/api/event';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { onMount } from 'svelte';
 
-  type SetupResult = {
-    permissions: Record<string, PermissionState>;
-    autostartConfigured: boolean;
+  type DockPosition = 'floating' | 'left' | 'right' | 'top';
+  type OverlaySnapshot = { dock: DockPosition; expanded: boolean };
+  type SetupResult = { autostartConfigured: boolean };
+  type SystemMetrics = {
+    cpuUsage: number;
+    cpuTemperature: number | null;
+    gameFps: number | null;
   };
 
   const desktopBridgeAvailable = isTauri();
-  let permissions: Record<string, PermissionState> = Object.fromEntries(
-    requiredPermissions.map(({ id }) => [id, 'unknown']),
-  );
-  let autostartConfigured = false;
+  const emptyMetrics: SystemMetrics = { cpuUsage: 0, cpuTemperature: null, gameFps: null };
+  let dockPosition: DockPosition = 'floating';
+  let panelOpen = false;
   let setupRunning = false;
+  let autostartConfigured = false;
+  let metrics = emptyMetrics;
   let notice = '';
+  let dragStart: { pointerId: number; x: number; y: number } | null = null;
+  let suppressClick = false;
 
-  $: ready = canFinishSetup(permissions, autostartConfigured);
+  onMount(() => {
+    if (!desktopBridgeAvailable) return;
+
+    let disposed = false;
+    let moveTimer: ReturnType<typeof setTimeout> | undefined;
+    let unlisteners: (() => void)[] = [];
+
+    void Promise.all([
+      listen('orb-setup-request', () => void setPanelOpen(true)),
+      listen<SystemMetrics>('system-metrics', ({ payload }) => {
+        metrics = payload;
+      }),
+      getCurrentWindow().onMoved(() => {
+        if (moveTimer) clearTimeout(moveTimer);
+        moveTimer = setTimeout(() => {
+          void invoke<OverlaySnapshot>('dock_overlay')
+            .then((layout) => {
+              dockPosition = layout.dock;
+              panelOpen = layout.expanded;
+            })
+            .catch((error: unknown) => {
+              notice = `贴边吸附失败：${String(error)}`;
+            });
+        }, 220);
+      }),
+    ])
+      .then((disposeListeners) => {
+        if (disposed) {
+          disposeListeners.forEach((dispose) => dispose());
+          return;
+        }
+        unlisteners = disposeListeners;
+        void invoke<OverlaySnapshot>('dock_overlay')
+          .then((layout) => {
+            dockPosition = layout.dock;
+            panelOpen = layout.expanded;
+          })
+          .catch((error: unknown) => {
+            notice = `悬浮球位置初始化失败：${String(error)}`;
+          });
+      })
+      .catch((error: unknown) => {
+        notice = `悬浮层事件初始化失败：${String(error)}`;
+      });
+
+    return () => {
+      disposed = true;
+      if (moveTimer) clearTimeout(moveTimer);
+      unlisteners.forEach((dispose) => dispose());
+    };
+  });
+
+  async function setPanelOpen(open: boolean): Promise<void> {
+    if (desktopBridgeAvailable) {
+      await invoke('set_overlay_open', { open });
+    }
+    panelOpen = open;
+    notice = '';
+  }
 
   async function beginSetup(): Promise<void> {
-    if (!desktopBridgeAvailable || setupRunning || ready) return;
+    if (setupRunning) return;
 
     setupRunning = true;
     notice = '';
     try {
-      const result = await invoke<SetupResult>('complete_first_run_setup');
-      permissions = result.permissions;
-      autostartConfigured = result.autostartConfigured;
-      if (!canFinishSetup(permissions, autostartConfigured)) {
-        notice = '仍有必需设置未完成，请按系统提示重试或前往系统设置。';
+      await setPanelOpen(true);
+      if (!desktopBridgeAvailable) {
+        notice = '浏览器预览不执行系统设置。请在 Orbit 桌面端使用此功能。';
+        return;
       }
-    } catch {
-      notice = '原生授权流程尚未接入；没有任何权限或启动项被标记为已完成。';
+
+      const result = await invoke<SetupResult>('complete_first_run_setup');
+      autostartConfigured = result.autostartConfigured;
+      notice = autostartConfigured ? '已启用登录时启动。' : '登录时启动尚未启用，请重试。';
+    } catch (error) {
+      notice = `一键设置失败：${String(error)}`;
     } finally {
       setupRunning = false;
     }
   }
+
+  function handlePointerDown(event: PointerEvent): void {
+    if (event.button !== 0) return;
+
+    dragStart = null;
+    suppressClick = event.detail === 2;
+    if (event.detail === 2) {
+      event.preventDefault();
+      return;
+    }
+    dragStart = { pointerId: event.pointerId, x: event.screenX, y: event.screenY };
+  }
+
+  function handlePointerMove(event: PointerEvent): void {
+    if (!dragStart || dragStart.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.screenX - dragStart.x, event.screenY - dragStart.y) <= 4) return;
+
+    dragStart = null;
+    suppressClick = true;
+    if (!desktopBridgeAvailable) return;
+
+    void getCurrentWindow()
+      .startDragging()
+      .catch((error: unknown) => {
+        notice = `悬浮球拖动失败：${String(error)}`;
+      });
+  }
+
+  function handlePointerUp(event: PointerEvent): void {
+    if (dragStart?.pointerId === event.pointerId) dragStart = null;
+  }
+
+  async function handleOrbClick(): Promise<void> {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    try {
+      await setPanelOpen(!panelOpen);
+    } catch (error) {
+      notice = `展开 Orbit 覆盖层失败：${String(error)}`;
+    }
+  }
+
+  async function handleContextMenu(event: MouseEvent): Promise<void> {
+    event.preventDefault();
+    if (!desktopBridgeAvailable) {
+      notice = '原生右键菜单仅在桌面端可用。';
+      panelOpen = true;
+      return;
+    }
+    try {
+      await invoke('show_orb_context_menu');
+    } catch (error) {
+      notice = `打开菜单失败：${String(error)}`;
+      try {
+        await setPanelOpen(true);
+      } catch (panelError) {
+        notice += `；展开覆盖层失败：${String(panelError)}`;
+      }
+    }
+  }
+
+  async function closePanel(): Promise<void> {
+    try {
+      await setPanelOpen(false);
+    } catch (error) {
+      notice = `收起覆盖层失败：${String(error)}`;
+    }
+  }
+
+  function formatCpuTemperature(value: number | null): string {
+    return value === null ? '--' : `${Math.round(value)}°`;
+  }
 </script>
 
 <svelte:head>
-  <title>首次设置 · Orbit</title>
-  <meta name="description" content="配置 Orbit 所需的系统权限和登录启动项" />
+  <title>Orbit · 桌面覆盖层</title>
+  <meta name="description" content="Orbit 桌面覆盖层与游戏状态浮窗" />
 </svelte:head>
 
-<div class="app-shell">
-  <main class="main-panel">
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Orbit 首页">
-        <span class="brand-mark" aria-hidden="true">O</span>
-        <span>ORBIT</span>
-      </a>
-      <span class:connected={desktopBridgeAvailable} class="environment-tag">
-        <span class="environment-dot"></span>
-        {desktopBridgeAvailable ? '桌面环境' : '浏览器预览'}
-      </span>
-    </header>
+<svelte:window
+  oncontextmenu={handleContextMenu}
+  onpointermove={handlePointerMove}
+  onpointerup={handlePointerUp}
+  onpointercancel={handlePointerUp}
+/>
 
-    <section class="setup-content">
-      <div class="intro">
-        <p class="kicker">首次启动</p>
-        <h1>让 Orbit 准备就绪<span class="title-period">。</span></h1>
-        <p class="intro-copy">
-          一次点击，开始配置 Orbit 所需权限并启用登录时启动。系统可能会逐项显示确认窗口。
-        </p>
-      </div>
-
-      <div class="section-heading">
-        <div>
-          <h2>将申请和设置</h2>
-          <p>系统会根据平台逐项确认，Orbit 不会代替你点击系统授权。</p>
-        </div>
-        <span class="required-label">必需</span>
-      </div>
-
-      <div class="permission-list">
-        {#each requiredPermissions as permission}
-          <div class="permission-row">
-            <span class:granted={permissions[permission.id] === 'granted'} class="permission-mark">
-              {permissions[permission.id] === 'granted' ? '✓' : ''}
-            </span>
-            <div class="permission-copy">
-              <h3>{permission.title}</h3>
-              <p>{permission.purpose}</p>
-            </div>
-            <span class="status-label">
-              {permissions[permission.id] === 'granted' ? '已完成' : '待申请'}
-            </span>
+<div
+  class:expanded={panelOpen}
+  class:top-docked={dockPosition === 'top'}
+  class:left-docked={dockPosition === 'left'}
+  class:right-docked={dockPosition === 'right'}
+  class="app-shell"
+>
+  {#if panelOpen}
+    <main class="island-panel">
+      <header class="panel-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">O</span>
+          <div>
+            <p class="eyebrow">ORBIT · DESKTOP OVERLAY</p>
+            <h1>{dockPosition === 'top' ? '灵动岛' : dockPosition === 'floating' ? 'Orbit' : 'Orbit 侧边栏'}</h1>
           </div>
-        {/each}
-        <div class="permission-row">
-          <span class:granted={autostartConfigured} class="permission-mark">
-            {autostartConfigured ? '✓' : ''}
-          </span>
-          <div class="permission-copy">
-            <h3>登录时启动</h3>
-            <p>完成首次设置后可在设置中关闭。</p>
-          </div>
-          <span class="status-label">{autostartConfigured ? '已完成' : '待设置'}</span>
         </div>
-      </div>
+        <button class="close-button" type="button" aria-label="收起覆盖层" onclick={closePanel}>×</button>
+      </header>
 
-      <p class="consent-note">
-        点击后 Orbit 会依次发起权限申请和启动项注册。部分系统权限必须在系统弹窗或设置页中由你确认。
+      <section class="telemetry-card" aria-label="系统与游戏状态">
+        <div class="telemetry-item">
+          <span>游戏帧率</span>
+          <strong>{metrics.gameFps === null ? '--' : metrics.gameFps}<small> FPS</small></strong>
+          <small class="metric-note">通用游戏接口未接入</small>
+        </div>
+        <div class="telemetry-item">
+          <span>系统 CPU</span>
+          <strong>{Math.round(metrics.cpuUsage)}<small>%</small></strong>
+          <small class="metric-note">整机总占用</small>
+        </div>
+        <div class="telemetry-item">
+          <span>CPU 温度</span>
+          <strong>{formatCpuTemperature(metrics.cpuTemperature)}</strong>
+          <small class="metric-note">{metrics.cpuTemperature === null ? '传感器不可用' : '传感器读数'}</small>
+        </div>
+      </section>
+
+      <button
+        class="configure-button"
+        type="button"
+        disabled={setupRunning}
+        onclick={beginSetup}
+      >
+        <span class="button-orbit" aria-hidden="true">O</span>
+        <span>{setupRunning ? '正在配置…' : autostartConfigured ? '登录启动已启用' : '一键配置登录启动'}</span>
+        <span aria-hidden="true">→</span>
+      </button>
+
+      <p class="privacy-note">
+        覆盖层始终请求置顶，但独占全屏游戏可能绕过桌面合成层；能否显示取决于系统、游戏全屏模式和显卡驱动。FPS 暂无通用读取接口。
       </p>
-
-      {#if !desktopBridgeAvailable}
-        <p class="notice" role="status">
-          浏览器预览仅展示流程；桌面端授权和登录启动桥接尚未接入。
-        </p>
-      {/if}
-
-      {#if notice}
-        <p class="notice" role="status">{notice}</p>
-      {/if}
-
-      <footer class="setup-footer">
-        <span class="gate-note">
-          {ready ? '必需设置已完成' : '完成必需设置后才能进入 Orbit'}
-        </span>
-        <button
-          class="continue-button"
-          type="button"
-          disabled={!desktopBridgeAvailable || setupRunning || ready}
-          onclick={beginSetup}
-        >
-          {setupRunning ? '正在申请…' : ready ? '配置完成' : '同意并开始配置'}
-          <span aria-hidden="true">{setupRunning ? '…' : '→'}</span>
-        </button>
-      </footer>
-    </section>
-  </main>
+      {#if notice}<p class="notice" role="status">{notice}</p>{/if}
+    </main>
+  {:else if dockPosition === 'top'}
+    <button
+      class="notch-button"
+      type="button"
+      aria-label="展开 Orbit 灵动岛"
+      title="Orbit · 点击展开"
+      onpointerdown={handlePointerDown}
+      onclick={handleOrbClick}
+    >
+      <span class="notch-brand">O</span>
+      <span class="notch-metric"><small>FPS</small> --</span>
+      <span class="notch-metric"><small>CPU</small> {Math.round(metrics.cpuUsage)}%</span>
+      <span class="notch-metric"><small>TEMP</small> {formatCpuTemperature(metrics.cpuTemperature)}</span>
+    </button>
+  {:else if dockPosition === 'left' || dockPosition === 'right'}
+    <button
+      class="edge-button"
+      type="button"
+      aria-label="展开 Orbit 侧边栏"
+      title="Orbit · 点击展开侧边栏"
+      onpointerdown={handlePointerDown}
+      onclick={handleOrbClick}
+    >
+      <span class="orb-glyph" aria-hidden="true">O</span>
+      <span class="edge-indicator" aria-hidden="true"></span>
+    </button>
+  {:else}
+    <button
+      class="orb-button"
+      type="button"
+      aria-label="展开 Orbit 悬浮岛"
+      title="Orbit · 点击展开"
+      onpointerdown={handlePointerDown}
+      onclick={handleOrbClick}
+    >
+      <span class="orb-glyph" aria-hidden="true">O</span>
+      <span class="orb-status" aria-hidden="true"></span>
+    </button>
+  {/if}
 </div>
