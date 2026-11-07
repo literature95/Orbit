@@ -4,12 +4,19 @@ version = "0.1.0"
 description = "Orbit desktop automation hub"
 edition = "2024"
 rust-version = "1.90"
+default-run = "orbit-desktop"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "orbit_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# ======== 第二个二进制：临时管理员 sidecar ========
+# 主进程普通权限，需要管理员功能时 runas 拉起这个 helper
+[[bin]]
+name = "orbit-elevated-helper"
+path = "src/helper/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }
@@ -22,10 +29,15 @@ tauri = { version = "2.12.5", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-window-state = "2.5.0"
-sysinfo = { version = "0.37.2", default-features = false, features = ["component", "system"] }
+tauri-plugin-dialog = "2"
+sysinfo = { version = "0.37.2", default-features = false, features = ["component", "system", "disk"] }
 orbit-core = { version = "0.1.0", path = "../crates/orbit-core" }
 xcap = "0.9.8"
 arboard = "3.7.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell"] }
+enigo = "0.2"
+rdev = "0.5"
+
+# helper 二进制用（和主进程共享 sysinfo/serde），但 serde_json 主进程也需要所以全局有
