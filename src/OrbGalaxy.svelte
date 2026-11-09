@@ -14,6 +14,12 @@
     hoverTarget = v ? 1 : 0;
   }
 
+  // 光标视差：px/py ∈ [-0.5, 0.5]，球随光标在球内位置轻微平移
+  export function setParallax(px: number, py: number) {
+    if (!canvas) return;
+    canvas.style.transform = `translate(${(-px * 10).toFixed(2)}px, ${(-py * 10).toFixed(2)}px)`;
+  }
+
   interface Particle {
     r: number;
     kVis: number;
@@ -32,6 +38,12 @@
     hoverBrightness: 1.0,
     hoverSpeedBoost: 1.0,
   };
+
+  // 外观参数：由父组件通过 props 注入（悬停亮度 / 转速倍率），可持久化
+  export let brightness = 1.0;
+  export let speedBoost = 1.0;
+  $: CONFIG.hoverBrightness = brightness;
+  $: CONFIG.hoverSpeedBoost = speedBoost;
 
   let SIZE = 82; // 跟随容器大小
   let CX = 0, CY = 0, RADIUS = 0;
@@ -250,5 +262,6 @@
     height: 100%;
     border-radius: inherit;
     pointer-events: none;
+    transition: transform .25s ease;
   }
 </style>

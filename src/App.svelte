@@ -5,6 +5,8 @@
   import { onMount } from 'svelte';
   import type { CommandRequest } from '../crates/orbit-core/bindings/CommandRequest';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import ClipboardPanel from './ClipboardPanel.svelte';
+  import DiscSettings from './DiscSettings.svelte';
   import OrbGalaxy from './OrbGalaxy.svelte';
 
   type DockPosition = 'floating' | 'left' | 'right' | 'top';
@@ -31,6 +33,8 @@
   type RegionBounds = { left: number; top: number; width: number; height: number };
 
   const desktopBridgeAvailable = isTauri();
+  // 同一份前端按窗口标签分流：clipboard 窗口只渲染剪贴板面板
+  const isClipboardWindow = desktopBridgeAvailable && getCurrentWindow().label === 'clipboard';
   const emptyMetrics: SystemMetrics = { cpuUsage: 0, cpuTemperature: null, gameFps: null };
   let dockPosition: DockPosition = 'floating';
   let panelOpen = false;
@@ -50,16 +54,39 @@
   let orbHovered = false;
   let galaxyRef: OrbGalaxy | null = null;
   let flashIndex = -1;
+  let convertInput: string | null = null;
+  let convertBusy = false;
+  const CONVERT_FORMATS = [
+    { id: 'mp3', label: 'MP3 音频' },
+    { id: 'wav', label: 'WAV 音频' },
+    { id: 'mp4', label: 'MP4 视频' },
+    { id: 'gif', label: 'GIF 动图' },
+    { id: 'webp', label: 'WebP 动图' },
+  ];
+
+  // 光标视差：把球内光标相对偏移传给 galaxy
+  function handleOrbParallax(event: MouseEvent): void {
+    if (!galaxyRef) return;
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const px = (event.clientX - rect.left) / rect.width - 0.5;
+    const py = (event.clientY - rect.top) / rect.height - 0.5;
+    galaxyRef.setParallax(px, py);
+  }
 
   // ============ 圆盘几何 ============
-  // DCX/DCY = SVG viewBox 中心 = 200/200（窗口 400×400）
+  // 展开窗口与 SVG viewBox 同为 340×340，画布 1 单位 = 1px
   // 悬浮球半径 = 41px（orb-button 宽 82px 的一半）
-  // 扇区内圈贴住球外圈，外圈紧凑不太长
-  const SEGS = 12;
-  const DCX = 200, DCY = 200;
+  // 内圆 / 外圆半径可在编辑页拖动，范围受窗口与最小扇区宽度约束
+  const VIEW = 340;
+  const DCX = VIEW / 2, DCY = VIEW / 2;
   const ORB_RADIUS = 41;
-  const R_IN = ORB_RADIUS + 6;   // 47 — 贴住球外圈
-  const R_OUT = 112;             // 紧凑，扇区宽度 = 65
+  const R_IN_MIN = ORB_RADIUS + 3;  // 44
+  const R_IN_MAX = 80;
+  const R_OUT_MIN = 96;
+  const R_OUT_MAX = VIEW / 2 - 38;  // 132 — 给顶部提示与底部按钮留出空位
+  const MIN_RING_WIDTH = 26;
+  const DEFAULT_DISC_GEOMETRY = { rIn: ORB_RADIUS + 6, rOut: 112 };
+  const DISC_GEOMETRY_KEY = 'orbit.discGeometry';
   const GAP = 2.0 * Math.PI / 180;
 
   function pt(r: number, a: number): [number, number] {
@@ -93,13 +120,94 @@
     { id: 'mcp', icon: '🔌', label: 'MCP 工具', handler: showMcp },
     { id: 'theme', icon: '🎨', label: '主题', handler: cycleTheme },
     { id: 'monitor', icon: '📊', label: '系统监控', handler: showSystemMonitor },
-    { id: 'setup', icon: '⚙️', label: '设置', handler: toggleAutostart },
+    { id: 'setup', icon: '⚙️', label: '设置', handler: openSettings },
     { id: 'close', icon: '✕', label: '关闭', handler: () => { void setPanelOpen(false); } },
   ];
 
+  const ACTION_MAP = new Map(actions.map((action) => [action.id, action]));
+  const DEFAULT_DISC_LAYOUT = actions.map((action) => action.id);
+  const DISC_LAYOUT_KEY = 'orbit.discLayout';
+
+  function sanitizeDiscLayout(value: unknown): string[] | null {
+    if (!Array.isArray(value)) return null;
+    const seen = new Set<string>();
+    const layout: string[] = [];
+    for (const id of value) {
+      if (typeof id !== 'string' || seen.has(id) || !ACTION_MAP.has(id)) continue;
+      seen.add(id);
+      layout.push(id);
+    }
+    return layout.length > 0 ? layout : null;
+  }
+
+  function loadDiscLayout(): string[] {
+    try {
+      const raw = localStorage.getItem(DISC_LAYOUT_KEY);
+      if (!raw) return [...DEFAULT_DISC_LAYOUT];
+      return sanitizeDiscLayout(JSON.parse(raw)) ?? [...DEFAULT_DISC_LAYOUT];
+    } catch {
+      return [...DEFAULT_DISC_LAYOUT];
+    }
+  }
+
+  function sanitizeDiscGeometry(value: unknown): { rIn: number; rOut: number } | null {
+    if (!value || typeof value !== 'object') return null;
+    const { rIn, rOut } = value as Record<string, unknown>;
+    if (typeof rIn !== 'number' || typeof rOut !== 'number') return null;
+    if (!Number.isFinite(rIn) || !Number.isFinite(rOut)) return null;
+    const safeIn = Math.min(R_IN_MAX, Math.max(R_IN_MIN, Math.round(rIn)));
+    const safeOut = Math.min(R_OUT_MAX, Math.max(R_OUT_MIN, Math.round(rOut)));
+    if (safeOut - safeIn < MIN_RING_WIDTH) return null;
+    return { rIn: safeIn, rOut: safeOut };
+  }
+
+  function loadDiscGeometry(): { rIn: number; rOut: number } {
+    try {
+      const raw = localStorage.getItem(DISC_GEOMETRY_KEY);
+      if (!raw) return { ...DEFAULT_DISC_GEOMETRY };
+      return sanitizeDiscGeometry(JSON.parse(raw)) ?? { ...DEFAULT_DISC_GEOMETRY };
+    } catch {
+      return { ...DEFAULT_DISC_GEOMETRY };
+    }
+  }
+
+  let discLayout: string[] = loadDiscLayout();
+  let discGeometry = loadDiscGeometry();
+  let draftGeometry = { ...discGeometry };
+  let settingsOpen = false;
+  let editMode = false;
+  let draftLayout: string[] = [];
+  let trayOpen = false;
+  let discSvg: SVGSVGElement | null = null;
+  let editDrag: { pointerId: number; index: number; startX: number; startY: number; active: boolean } | null = null;
+  let resizeDrag: { pointerId: number; kind: 'inner' | 'outer' } | null = null;
+  let editTarget = -1;
+  let editRemove = false;
+  $: viewRIn = editMode ? draftGeometry.rIn : discGeometry.rIn;
+  $: viewROut = editMode ? draftGeometry.rOut : discGeometry.rOut;
+
+  $: discActions = discLayout
+    .map((id) => ACTION_MAP.get(id))
+    .filter((action): action is DiscAction => Boolean(action));
+  $: draftActions = draftLayout
+    .map((id) => ACTION_MAP.get(id))
+    .filter((action): action is DiscAction => Boolean(action));
+  $: viewActions = editMode ? draftActions : discActions;
+  $: sectorCount = viewActions.length || 1;
+  $: unusedActions = actions.filter((action) => !draftLayout.includes(action.id));
+
   function segClick(idx: number) {
+    const action = discActions[idx];
+    // 清掉悬浮球拖拽残留，避免拖动逻辑吞掉这次点击
+    dragStart = null;
+    suppressClick = false;
     flashIndex = idx;
-    setTimeout(() => { flashIndex = -1; void actions[idx].handler(); }, 180);
+    notice = `⏳ ${action.label}…`;
+    setTimeout(() => { flashIndex = -1; }, 220);
+    // 立即执行，不再延迟；失败也能给出可见反馈
+    void Promise.resolve(action.handler()).catch((error: unknown) => {
+      notice = `${action.label}失败：${String(error)}`;
+    });
   }
 
   // ============ 灵动岛仪表盘 ============
@@ -111,17 +219,9 @@
     uptimeSecs: number;
     timeNow: string;
     clipboardCount: number;
+    temperatureC: number | null;
   };
   let dashInfo: DashInfo | null = null;
-
-  function formatUptime(secs: number) {
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
-    if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
-    if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
-    return `${s}s`;
-  }
 
   function formatClock() {
     const d = new Date();
@@ -134,14 +234,15 @@
   }
 
   // ============ 主题系统 ============
-  const THEMES = ['cosmic-violet', 'pure-black', 'cyber-blue', 'mono-light'] as const;
+  const THEMES = ['orbit-white', 'cosmic-violet', 'pure-black', 'cyber-blue', 'mono-light'] as const;
   const THEME_LABELS: Record<(typeof THEMES)[number], string> = {
+    'orbit-white': 'Orbit 白',
     'cosmic-violet': '深空紫',
     'pure-black': '纯黑极简',
     'cyber-blue': '赛博蓝',
     'mono-light': '极简白',
   };
-  let currentTheme: (typeof THEMES)[number] = 'cosmic-violet';
+  let currentTheme: (typeof THEMES)[number] = 'orbit-white';
 
   function applyTheme(theme: (typeof THEMES)[number]) {
     currentTheme = theme;
@@ -188,10 +289,10 @@
   async function toggleKbRecord() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
     if (!kbRecording) {
-      try { await invoke('kb_record_start'); kbRecording = true; notice = '🎮 键鼠录制中…（ESC 无法停止，重启应用）'; }
+      try { await invoke('kb_record_start'); kbRecording = true; notice = '🎮 键鼠录制中…再次点击扇区停止并保存'; }
       catch (e) { notice = `录制启动失败：${String(e)}`; }
     } else {
-      try { await invoke('kb_record_stop'); kbRecording = false; notice = '🎮 录制已停止'; }
+      try { await invoke('kb_record_stop'); kbRecording = false; notice = '🎮 录制已停止并保存到本地'; }
       catch (e) { notice = `停止失败：${String(e)}`; }
     }
   }
@@ -199,31 +300,43 @@
   async function runConvert() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
     try {
-      const { open, save } = await import('@tauri-apps/plugin-dialog');
+      const { open } = await import('@tauri-apps/plugin-dialog');
       const input = await open({ title: '选择要转换的文件', multiple: false });
       if (!input || typeof input !== 'string') { notice = '已取消'; return; }
+      convertInput = input;
+      notice = '🔄 选择目标格式';
+    } catch (e) { notice = `选择文件失败：${String(e)}`; }
+  }
 
-      // 问目标格式
-      const formats = ['mp3', 'gif', 'webp', 'mp4', 'wav'];
-      // 简化：直接让用户选扩展名（这里 hardcode 转 mp3 演示完整链路）
-      const targetFmt = 'mp3';
-
+  async function chooseConvertFormat(format: string) {
+    if (!convertInput || convertBusy) return;
+    const input = convertInput;
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
       const outPath = await save({
-        title: `保存为 .${targetFmt}`,
-        defaultPath: input.replace(/\.[^.]+$/, `.${targetFmt}`),
+        title: `保存为 .${format}`,
+        defaultPath: input.replace(/\.[^.]+$/, `.${format}`),
       });
-      if (!outPath) { notice = '已取消'; return; }
-
-      notice = `🔄 正在转换 → ${outPath}`;
+      if (!outPath) return;
+      convertBusy = true;
+      notice = `🔄 正在转换为 ${format.toUpperCase()}…`;
       const result = await invoke<string>('convert_format', {
         inputPath: input,
         outputPath: outPath,
-        format: targetFmt,
+        format,
       });
       notice = `✅ 转换完成：${result}`;
+      convertInput = null;
     } catch (e) {
-      notice = `转换失败：${String(e)}（需要系统安装 FFmpeg）`;
+      notice = `转换失败：${String(e)}`;
+    } finally {
+      convertBusy = false;
     }
+  }
+
+  function cancelConvert() {
+    convertInput = null;
+    notice = '已取消转换';
   }
 
   function showMcp() {
@@ -238,87 +351,41 @@
       notice = `系统信息获取失败：${String(error)}`;
     }
   }
-  // ============ 剪贴板历史 ============
-  interface ClipItem { text: string; preview: string; createdAt: number; }
-  let clipHistory: ClipItem[] = [];
-  let clipPollTimer: ReturnType<typeof setInterval> | null = null;
+  // ============ 剪贴板：采集/存储已下沉到 Rust + SQLite，前端只负责唤起面板 ============
   let dashPollTimer: ReturnType<typeof setInterval> | null = null;
   let clockTimer: ReturnType<typeof setInterval> | null = null;
 
   async function pollDashInfo() {
-    if (!desktopBridgeAvailable) {
-      dashInfo = {
-        cpuPercent: 0, memoryUsedPercent: 0, memoryUsedMb: 0, memoryTotalMb: 0,
-        uptimeSecs: 0, timeNow: '', clipboardCount: clipHistory.length,
-      };
-      return;
+    if (!desktopBridgeAvailable) return;
+    try {
+      dashInfo = await invoke<DashInfo>('get_dash_info');
+    } catch { /* 保留上一次真实采样，不用占位值覆盖 */ }
+  }
+
+  async function showClipHistory(): Promise<void> {
+    if (!desktopBridgeAvailable) { notice = '请在 Orbit 桌面端使用剪贴板历史。'; return; }
+    try {
+      await invoke('clip_open_window');
+      await setPanelOpen(false);
+    } catch (error) {
+      notice = `打开剪贴板失败：${String(error)}`;
     }
-    try {
-      const d = await invoke<DashInfo>('get_dash_info');
-      d.clipboardCount = clipHistory.length;
-      dashInfo = d;
-    } catch { /* 忽略 */ }
-  }
-
-  function loadClipHistory() {
-    try { clipHistory = JSON.parse(localStorage.getItem('orbit.clipHistory') || '[]'); } catch { clipHistory = []; }
-  }
-  function saveClipHistory() {
-    try { localStorage.setItem('orbit.clipHistory', JSON.stringify(clipHistory.slice(0, 50))); } catch {}
-  }
-
-  async function pollClipboard() {
-    if (!desktopBridgeAvailable) return;
-    try {
-      const text = await invoke<string>('clip_read');
-      if (text && text.trim()) {
-        const last = clipHistory[0];
-        if (!last || last.text !== text) {
-          clipHistory.unshift({
-            text,
-            preview: text.length > 60 ? text.slice(0, 60) + '…' : text.replace(/\n/g, ' '),
-            createdAt: Date.now(),
-          });
-          clipHistory = clipHistory.slice(0, 50);
-          saveClipHistory();
-        }
-      }
-    } catch {}
-  }
-
-  async function readClipboard() {
-    if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
-    try {
-      const text = await invoke<string>('clip_read');
-      if (text) { notice = `📋 当前剪贴板（${text.length}字）：${text.slice(0, 40)}…`; }
-      else { notice = '剪贴板为空。'; }
-    } catch (error) { notice = `读取失败：${String(error)}`; }
-  }
-
-  async function writeClipboard(item: ClipItem) {
-    if (!desktopBridgeAvailable) return;
-    try { await invoke('clip_write', { text: item.text }); notice = '已写回剪贴板'; }
-    catch (error) { notice = `写入失败：${String(error)}`; }
-  }
-
-  function showClipHistory() {
-    if (clipHistory.length === 0) { notice = '剪贴板历史为空（每 3 秒自动轮询）。'; return; }
-    notice = `📋 历史 ${clipHistory.length} 条 · 最新：${clipHistory[0].preview}`;
   }
 
   // 初始化：从 localStorage 读主题
   onMount(() => {
-    loadClipHistory();
-    pollClipboard(); // 立即读一次
-    clipPollTimer = setInterval(pollClipboard, 3000); // 每 3 秒轮询
-    pollDashInfo();
-    dashPollTimer = setInterval(pollDashInfo, 2000);
-    clockNow = formatClock();
-    clockTimer = setInterval(() => { clockNow = formatClock(); }, 1000);
     try {
       const saved = localStorage.getItem('orbit.theme') as (typeof THEMES)[number] | null;
       if (saved && THEMES.includes(saved)) applyTheme(saved);
     } catch { /* ignore */ }
+
+    // 剪贴板窗口由 ClipboardPanel 自行接管，不注册悬浮层事件与仪表盘轮询
+    if (isClipboardWindow) return;
+
+    pollDashInfo();
+    dashPollTimer = setInterval(pollDashInfo, 2000);
+    clockNow = formatClock();
+    clockTimer = setInterval(() => { clockNow = formatClock(); }, 1000);
     if (!desktopBridgeAvailable) return;
 
     const currentWindow = getCurrentWindow();
@@ -355,7 +422,6 @@
     let unlisteners: (() => void)[] = [];
 
     void Promise.all([
-      listen('orb-setup-request', () => void beginSetup()),
       listen<{ response?: CommandResponse; error?: string; cancelled?: boolean }>(
         'region-capture-result',
         ({ payload }) => {
@@ -427,6 +493,193 @@
     }
     panelOpen = open;
     notice = '';
+    if (!open) {
+      convertInput = null;
+      settingsOpen = false;
+      editMode = false;
+      trayOpen = false;
+      editDrag = null;
+      resizeDrag = null;
+      editTarget = -1;
+      editRemove = false;
+    }
+  }
+
+  async function openSettings(): Promise<void> {
+    try {
+      await setPanelOpen(true);
+      settingsOpen = true;
+    } catch (error) {
+      notice = `打开设置失败：${String(error)}`;
+    }
+  }
+
+  function startEdit(): void {
+    draftLayout = [...discLayout];
+    draftGeometry = { ...discGeometry };
+    editMode = true;
+    trayOpen = false;
+    editDrag = null;
+    resizeDrag = null;
+    editTarget = -1;
+    editRemove = false;
+    notice = '';
+  }
+
+  function cancelEdit(): void {
+    editMode = false;
+    trayOpen = false;
+    editDrag = null;
+    resizeDrag = null;
+    editTarget = -1;
+    editRemove = false;
+    notice = '';
+  }
+
+  function saveEdit(): void {
+    const next = sanitizeDiscLayout(draftLayout);
+    if (!next) return;
+    discLayout = next;
+    discGeometry = { ...draftGeometry };
+    try {
+      localStorage.setItem(DISC_LAYOUT_KEY, JSON.stringify(next));
+      localStorage.setItem(DISC_GEOMETRY_KEY, JSON.stringify(draftGeometry));
+    } catch { /* ignore */ }
+    editMode = false;
+    settingsOpen = false;
+    trayOpen = false;
+    editDrag = null;
+    resizeDrag = null;
+    editTarget = -1;
+    editRemove = false;
+    notice = `轮盘布局已保存（${next.length} 项）。`;
+  }
+
+  function restoreDefaultLayout(): void {
+    draftLayout = [...DEFAULT_DISC_LAYOUT];
+    draftGeometry = { ...DEFAULT_DISC_GEOMETRY };
+    trayOpen = false;
+  }
+
+  function toggleTray(): void {
+    trayOpen = !trayOpen;
+  }
+
+  function addDraftFunction(id: string): void {
+    draftLayout = [...draftLayout, id];
+    trayOpen = false;
+  }
+
+  function discardSector(index: number): void {
+    if (draftLayout.length <= 1) return;
+    draftLayout = draftLayout.filter((_, i) => i !== index);
+  }
+
+  function editPointerInfo(event: PointerEvent): { distance: number; angle: number } | null {
+    if (!discSvg) return null;
+    const rect = discSvg.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const x = ((event.clientX - rect.left) / rect.width) * VIEW;
+    const y = ((event.clientY - rect.top) / rect.height) * VIEW;
+    const dx = x - DCX;
+    const dy = y - DCY;
+    let angle = Math.atan2(dy, dx);
+    if (angle < 0) angle += Math.PI * 2;
+    return { distance: Math.hypot(dx, dy), angle };
+  }
+
+  function editIndexAt(angle: number): number {
+    const count = draftLayout.length || 1;
+    return Math.max(0, Math.min(count - 1, Math.floor(angle / ((Math.PI * 2) / count))));
+  }
+
+  function editPointerDown(event: PointerEvent, index: number): void {
+    event.stopPropagation();
+    editDrag = { pointerId: event.pointerId, index, startX: event.clientX, startY: event.clientY, active: false };
+    editTarget = index;
+    editRemove = false;
+    // 捕获到 SVG 而非根节点：事件仍冒泡到 window，但松手落在窗口外也能收到 pointerup
+    try { discSvg?.setPointerCapture(event.pointerId); } catch { /* 指针已失效时忽略 */ }
+  }
+
+  function editPointerMove(event: PointerEvent): void {
+    if (!editDrag || editDrag.pointerId !== event.pointerId) return;
+    if (!editDrag.active) {
+      if (Math.hypot(event.clientX - editDrag.startX, event.clientY - editDrag.startY) <= 5) return;
+      editDrag = { ...editDrag, active: true };
+    }
+    const info = editPointerInfo(event);
+    editRemove = info !== null && info.distance <= viewRIn;
+    editTarget = info && !editRemove && info.distance <= viewROut + 28 ? editIndexAt(info.angle) : -1;
+  }
+
+  function editPointerUp(event: PointerEvent): void {
+    if (!editDrag || editDrag.pointerId !== event.pointerId) return;
+    const drag = editDrag;
+    editDrag = null;
+    const target = editTarget;
+    editTarget = -1;
+    editRemove = false;
+    if (!drag.active) return;
+    const info = editPointerInfo(event);
+    if (!info) return;
+    // 拖到内圆里或拖出外圈：移除该扇区，其余扇区自动等分圆盘补位
+    if (info.distance <= viewRIn || info.distance > viewROut + 28) {
+      discardSector(drag.index);
+      return;
+    }
+    if (target < 0 || target === drag.index) return;
+    const next = [...draftLayout];
+    const [moved] = next.splice(drag.index, 1);
+    next.splice(target, 0, moved);
+    draftLayout = next;
+  }
+
+  function resizePointerDown(event: PointerEvent, kind: 'inner' | 'outer'): void {
+    event.stopPropagation();
+    resizeDrag = { pointerId: event.pointerId, kind };
+    editRemove = false;
+    editTarget = -1;
+    try { discSvg?.setPointerCapture(event.pointerId); } catch { /* 指针已失效时忽略 */ }
+  }
+
+  function applyRingRadius(kind: 'inner' | 'outer', distance: number): void {
+    if (kind === 'inner') {
+      const upper = Math.min(R_IN_MAX, draftGeometry.rOut - MIN_RING_WIDTH);
+      const value = Math.min(upper, Math.max(R_IN_MIN, Math.round(distance)));
+      draftGeometry = { ...draftGeometry, rIn: value };
+    } else {
+      const lower = Math.max(R_OUT_MIN, draftGeometry.rIn + MIN_RING_WIDTH);
+      const value = Math.max(lower, Math.min(R_OUT_MAX, Math.round(distance)));
+      draftGeometry = { ...draftGeometry, rOut: value };
+    }
+  }
+
+  function resizePointerMove(event: PointerEvent): void {
+    if (!resizeDrag || resizeDrag.pointerId !== event.pointerId) return;
+    const info = editPointerInfo(event);
+    if (!info) return;
+    applyRingRadius(resizeDrag.kind, info.distance);
+  }
+
+  function resizeKeydown(event: KeyboardEvent, kind: 'inner' | 'outer'): void {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const base = kind === 'inner' ? draftGeometry.rIn : draftGeometry.rOut;
+    applyRingRadius(kind, base + (event.key === 'ArrowUp' ? 2 : -2));
+  }
+
+  async function quitApp(): Promise<void> {
+    if (!desktopBridgeAvailable) {
+      notice = '浏览器预览无法退出 Orbit。';
+      return;
+    }
+    try {
+      await invoke('quit_app');
+    } catch (error) {
+      notice = `退出失败：${String(error)}`;
+    }
   }
 
   async function beginSetup(): Promise<void> {
@@ -604,6 +857,10 @@
     }
     if (panelOpen && event.key === 'Escape') {
       event.preventDefault();
+      if (editMode) {
+        cancelEdit();
+        return;
+      }
       void setPanelOpen(false);
     }
   }
@@ -621,6 +878,15 @@
   }
 
   function handlePointerMove(event: PointerEvent): void {
+    // 编辑模式：拖拽状态在窗口级跟踪，避免指针捕获把事件重定向到根节点
+    if (resizeDrag) {
+      resizePointerMove(event);
+      return;
+    }
+    if (editDrag) {
+      editPointerMove(event);
+      return;
+    }
     if (!dragStart || dragStart.pointerId !== event.pointerId) return;
     if (Math.hypot(event.screenX - dragStart.x, event.screenY - dragStart.y) <= 4) return;
 
@@ -636,6 +902,14 @@
   }
 
   function handlePointerUp(event: PointerEvent): void {
+    if (resizeDrag) {
+      if (resizeDrag.pointerId === event.pointerId) resizeDrag = null;
+      return;
+    }
+    if (editDrag) {
+      editPointerUp(event);
+      return;
+    }
     if (dragStart?.pointerId === event.pointerId) dragStart = null;
   }
 
@@ -655,27 +929,22 @@
     }
   }
 
+  // 圆盘展开时中心球既用于拖动窗口，也用于点击收起：拖拽后的 click 直接吞掉
+  function handleExpandedOrbClick(): void {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    void setPanelOpen(false);
+  }
+
   async function handleContextMenu(event: MouseEvent): Promise<void> {
     event.preventDefault();
     if (selectingRegion) {
       await cancelRegionScreenshot();
       return;
     }
-    if (!desktopBridgeAvailable) {
-      notice = '原生右键菜单仅在桌面端可用。';
-      panelOpen = true;
-      return;
-    }
-    try {
-      await invoke('show_orb_context_menu');
-    } catch (error) {
-      notice = `打开菜单失败：${String(error)}`;
-      try {
-        await setPanelOpen(true);
-      } catch (panelError) {
-        notice += `；展开覆盖层失败：${String(panelError)}`;
-      }
-    }
+    await openSettings();
   }
 
   async function closePanel(): Promise<void> {
@@ -689,6 +958,12 @@
   function formatCpuTemperature(value: number | null): string {
     return value === null ? '--' : `${Math.round(value)}°`;
   }
+
+  // 剪贴板窗口不参与悬浮球交互，避免全局拖拽 / 右键菜单干扰面板
+  const mainContextMenu = (event: MouseEvent) => { if (!isClipboardWindow) void handleContextMenu(event); };
+  const mainPointerMove = (event: PointerEvent) => { if (!isClipboardWindow) handlePointerMove(event); };
+  const mainPointerUp = (event: PointerEvent) => { if (!isClipboardWindow) handlePointerUp(event); };
+  const mainKeyDown = (event: KeyboardEvent) => { if (!isClipboardWindow) handleKeyDown(event); };
 </script>
 
 <svelte:head>
@@ -697,14 +972,16 @@
 </svelte:head>
 
 <svelte:window
-  oncontextmenu={handleContextMenu}
-  onpointermove={handlePointerMove}
-  onpointerup={handlePointerUp}
-  onpointercancel={handlePointerUp}
-  onkeydown={handleKeyDown}
+  oncontextmenu={mainContextMenu}
+  onpointermove={mainPointerMove}
+  onpointerup={mainPointerUp}
+  onpointercancel={mainPointerUp}
+  onkeydown={mainKeyDown}
 />
 
-{#if selectingRegion}
+{#if isClipboardWindow}
+  <ClipboardPanel />
+{:else if selectingRegion}
   <main
     class="region-selection-shell"
     aria-label="拖动选择截图区域，按 Escape 取消"
@@ -735,28 +1012,55 @@
   class:left-docked={dockPosition === 'left'}
   class:right-docked={dockPosition === 'right'}
   class="app-shell"
-  onclick={(e) => {
-    // 点击 app-shell 空白处（非 disc 内部）收起
-    if (panelOpen && (e.target as HTMLElement).classList?.contains('app-shell')) {
-      void setPanelOpen(false);
-    }
-  }}
 >
   {#if panelOpen}
-    <!-- SVG 圆盘扇区 -->
-    <svg class="disc open" viewBox="0 0 400 400">
-      {#each actions as a, i}
-        {@const a0 = (i / SEGS) * Math.PI * 2 + GAP / 2}
-        {@const a1 = ((i + 1) / SEGS) * Math.PI * 2 - GAP / 2}
+    {#if settingsOpen && !editMode}
+      <DiscSettings
+        autostartConfigured={autostartConfigured}
+        setupRunning={setupRunning}
+        {notice}
+        layoutCount={discLayout.length}
+        onedit={startEdit}
+        ontoggleautostart={() => void toggleAutostart()}
+        onquit={() => void quitApp()}
+        onclose={() => { settingsOpen = false; }}
+      />
+    {:else}
+    <!-- SVG 圆盘扇区；鼠标驱动的悬浮层，键盘收起由全局 Esc 处理 -->
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <svg
+      class="disc open"
+      class:editing={editMode}
+      class:removing={editMode && editRemove}
+      bind:this={discSvg}
+      viewBox={`0 0 ${VIEW} ${VIEW}`}
+      onclick={(e) => {
+        // 点击圆盘外的空白区收起（扇区自身会 stopPropagation）
+        if (e.target === e.currentTarget && !editMode) void setPanelOpen(false);
+      }}
+    >
+      {#each viewActions as a, i}
+        {@const a0 = (i / sectorCount) * Math.PI * 2 + GAP / 2}
+        {@const a1 = ((i + 1) / sectorCount) * Math.PI * 2 - GAP / 2}
         {@const mid = (a0 + a1) / 2}
-        {@const [tx, ty] = pt((R_IN + R_OUT) / 2, mid)}
+        {@const [tx, ty] = pt((viewRIn + viewROut) / 2, mid)}
         <g
           class="seg-group"
           class:flash={flashIndex === i}
+          class:edit-highlight={editMode && editTarget === i}
+          role="button"
+          tabindex="0"
+          aria-label={a.label}
           style="--d: {(i * 0.032).toFixed(3)}s"
-          onclick={(e) => { e.stopPropagation(); segClick(i); }}
+          onpointerdown={editMode
+            ? (e) => editPointerDown(e, i)
+            : (e) => { e.stopPropagation(); dragStart = null; }}
+          onclick={(e) => { e.stopPropagation(); if (!editMode) segClick(i); }}
+          onkeydown={(e) => {
+            if (!editMode && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); segClick(i); }
+          }}
         >
-          <path class="seg-fill" d={sectorPath(R_IN, R_OUT, a0, a1)} />
+          <path class="seg-fill" d={sectorPath(viewRIn, viewROut, a0, a1)} />
           <text
             class="seg-label"
             x={tx}
@@ -766,27 +1070,123 @@
           >{a.label}</text>
         </g>
       {/each}
+
+      {#if editMode}
+        <circle class="edit-ring" cx={DCX} cy={DCY} r={viewRIn} />
+        <circle class="edit-ring" cx={DCX} cy={DCY} r={viewROut} />
+        <g
+          class="edit-knob"
+          role="slider"
+          tabindex="0"
+          aria-label="内圆大小"
+          aria-valuemin={R_IN_MIN}
+          aria-valuemax={R_IN_MAX}
+          aria-valuenow={Math.round(viewRIn)}
+          onpointerdown={(e) => resizePointerDown(e, 'inner')}
+          onkeydown={(e) => resizeKeydown(e, 'inner')}
+        >
+          <circle cx={DCX} cy={DCY - viewRIn} r="7" />
+          <title>拖动或按 ↑↓ 调整内圆</title>
+        </g>
+        <text class="edit-ring-value" x={DCX + 14} y={DCY - viewRIn} dominant-baseline="middle">{Math.round(viewRIn)}</text>
+        <g
+          class="edit-knob"
+          role="slider"
+          tabindex="0"
+          aria-label="外圈大小"
+          aria-valuemin={R_OUT_MIN}
+          aria-valuemax={R_OUT_MAX}
+          aria-valuenow={Math.round(viewROut)}
+          onpointerdown={(e) => resizePointerDown(e, 'outer')}
+          onkeydown={(e) => resizeKeydown(e, 'outer')}
+        >
+          <circle cx={DCX} cy={DCY - viewROut} r="7" />
+          <title>拖动或按 ↑↓ 调整外圈</title>
+        </g>
+        <text class="edit-ring-value" x={DCX + 14} y={DCY - viewROut} dominant-baseline="middle">{Math.round(viewROut)}</text>
+      {/if}
     </svg>
 
     <!-- 中心悬浮球 -->
     <div class="orb-center">
-      <button
-        class="orb-button active"
-        class:hovered={orbHovered}
-        type="button"
-        aria-label="关闭圆盘"
-        title="Orbit · 点击收起"
-        onpointerdown={(e) => e.stopPropagation()}
-        onclick={(e) => { e.stopPropagation(); void setPanelOpen(false); }}
-        onmouseenter={() => { orbHovered = true; galaxyRef?.setHover(true); }}
-        onmouseleave={() => { orbHovered = false; galaxyRef?.setHover(false); }}
-      >
-        <OrbGalaxy bind:this={galaxyRef} />
-        <span class="orb-ring" aria-hidden="true"></span>
-        <span class="orb-ring slow" aria-hidden="true"></span>
-      </button>
-      {#if notice}<p class="disc-notice" role="status">{notice}</p>{/if}
+      {#if editMode}
+        <button
+          class="orb-button active"
+          type="button"
+          aria-label="添加功能"
+          title="点击选择要加回的功能"
+          onpointerdown={(e) => e.stopPropagation()}
+          onclick={(e) => { e.stopPropagation(); toggleTray(); }}
+        >
+          <OrbGalaxy bind:this={galaxyRef} />
+          <span class="edit-add-glyph" class:remove={editRemove} aria-hidden="true">{editRemove ? '✕' : '+'}</span>
+        </button>
+      {:else}
+        <button
+          class="orb-button active"
+          class:hovered={orbHovered}
+          type="button"
+          aria-label="移动或收起圆盘"
+          title="Orbit · 拖动移动，点击收起"
+          onpointerdown={handlePointerDown}
+          onclick={(e) => { e.stopPropagation(); handleExpandedOrbClick(); }}
+          onmouseenter={() => { orbHovered = true; galaxyRef?.setHover(true); }}
+          onmouseleave={() => { orbHovered = false; galaxyRef?.setHover(false); galaxyRef?.setParallax(0, 0); }}
+          onmousemove={handleOrbParallax}
+        >
+          <OrbGalaxy bind:this={galaxyRef} />
+          <span class="orb-wordmark" aria-hidden="true">Orbit</span>
+          <span class="orb-ring" aria-hidden="true"></span>
+          <span class="orb-ring slow" aria-hidden="true"></span>
+        </button>
+        {#if notice}<p class="disc-notice" role="status">{notice}</p>{/if}
+      {/if}
     </div>
+
+    {#if editMode}
+      <p class="edit-hint" role="status">
+        {editRemove ? '松手删除该扇区' : `拖动排序 · 拖到中心或拖出圆盘删除 · ${draftLayout.length} 项`}
+      </p>
+      <div class="edit-bar">
+        <button class="settings-btn ghost" type="button" onclick={restoreDefaultLayout}>恢复默认</button>
+        <button class="settings-btn" type="button" onclick={cancelEdit}>取消</button>
+        <button class="settings-btn primary" type="button" onclick={saveEdit}>保存</button>
+      </div>
+      {#if trayOpen}
+        <div class="add-tray" role="dialog" aria-label="添加功能">
+          <p class="convert-title">添加功能</p>
+          {#if unusedActions.length === 0}
+            <p class="add-tray-empty">全部功能已在圆盘上</p>
+          {:else}
+            {#each unusedActions as f (f.id)}
+              <button type="button" class="convert-option" onclick={() => addDraftFunction(f.id)}>
+                {f.icon} {f.label}
+              </button>
+            {/each}
+          {/if}
+          <button type="button" class="convert-option cancel" onclick={() => { trayOpen = false; }}>取消</button>
+        </div>
+      {/if}
+    {:else if convertInput}
+      <div class="convert-picker" role="dialog" aria-label="选择转换目标格式">
+        <p class="convert-title">转换为…</p>
+        {#each CONVERT_FORMATS as f}
+          <button
+            type="button"
+            class="convert-option"
+            disabled={convertBusy}
+            onclick={() => void chooseConvertFormat(f.id)}
+          >{f.label}</button>
+        {/each}
+        <button
+          type="button"
+          class="convert-option cancel"
+          disabled={convertBusy}
+          onclick={cancelConvert}
+        >取消</button>
+      </div>
+    {/if}
+    {/if}
   {:else if dockPosition === 'top'}
     <button
       class="notch-button"
@@ -796,13 +1196,17 @@
       onpointerdown={handlePointerDown}
       onclick={handleOrbClick}
     >
-      <span class="notch-metric"><small>⏱</small>{clockNow}</span>
-      <span class="notch-sep"></span>
-      <span class="notch-metric"><small>CPU</small>{dashInfo ? Math.round(dashInfo.cpuPercent) : '--'}%</span>
-      <span class="notch-metric"><small>MEM</small>{dashInfo ? Math.round(dashInfo.memoryUsedPercent) : '--'}%</span>
-      <span class="notch-sep"></span>
-      <span class="notch-metric"><small>⟳</small>{dashInfo ? formatUptime(dashInfo.uptimeSecs) : '--'}</span>
-      <span class="notch-metric"><small>📋</small>{dashInfo ? dashInfo.clipboardCount : clipHistory.length}</span>
+      <span class="notch-clock">{clockNow}</span>
+      {#if dashInfo}
+        <span class="notch-sep"></span>
+        <span class="notch-stats">
+          <span class="notch-stat"><small>处理器</small>{Math.round(dashInfo.cpuPercent)}%</span>
+          <span class="notch-stat"><small>内存</small>{Math.round(dashInfo.memoryUsedPercent)}%</span>
+          {#if dashInfo.temperatureC != null}
+            <span class="notch-stat" title="CPU 温度"><small>温度</small>{Math.round(dashInfo.temperatureC)}°C</span>
+          {/if}
+        </span>
+      {/if}
     </button>
   {:else if dockPosition === 'left' || dockPosition === 'right'}
     <button
@@ -826,9 +1230,11 @@
       onpointerdown={handlePointerDown}
       onclick={handleOrbClick}
       onmouseenter={() => { orbHovered = true; galaxyRef?.setHover(true); }}
-      onmouseleave={() => { orbHovered = false; galaxyRef?.setHover(false); }}
+      onmouseleave={() => { orbHovered = false; galaxyRef?.setHover(false); galaxyRef?.setParallax(0, 0); }}
+      onmousemove={handleOrbParallax}
     >
       <OrbGalaxy bind:this={galaxyRef} />
+      <span class="orb-wordmark" aria-hidden="true">Orbit</span>
       <span class="orb-ring" aria-hidden="true"></span>
       <span class="orb-ring slow" aria-hidden="true"></span>
     </button>

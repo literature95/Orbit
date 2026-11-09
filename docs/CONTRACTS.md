@@ -19,3 +19,7 @@ The Tauri UI invokes `execute_command` with a `CommandRequest`. The source is as
 The command catalog is available through `get_command_catalog`. Unsupported IDs return an error response and are audited. If the audit write itself fails, the invocation reports that failure rather than claiming success.
 
 The command catalog, audit schema, and capability set are still under development. Do not treat unimplemented roadmap commands as available.
+
+## Direct IPC commands outside the bus
+
+As of 2026-11-09, most capabilities are registered as direct Tauri IPC commands in `src-tauri/src/lib.rs` and `src-tauri/src/clipboard.rs` (35 commands: setup/autostart, region selection, overlay layout, app quit, system info/dashboard, elevated toggle, clipboard read/write/history, screen recording, OCR, keyboard-mouse recording, format conversion). They do not go through `execute_command`, have no `CommandSpec` entries, and are not audited. Migrating them onto the bus with contracts and risk levels is planned work; see the README progress section for known defects in each prototype.

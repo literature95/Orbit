@@ -1,13 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="100%" height="100%" role="img" aria-label="Orbit logo">
-  <!-- 纯白底圆角正方形，完全填满画布，外部背景为透明 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="Orbit logo">
+  <!-- 白底圆角方块，透明四角；Orbit 居中约占 3/4，四周留白 -->
   <rect x="0" y="0" width="200" height="200" rx="40" fill="#FFFFFF" />
-  
-  <!-- 居中的超大号黑色 Orbit -->
-  <text x="100" y="106"
+  <text x="100" y="100"
         text-anchor="middle"
         dominant-baseline="middle"
         font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
-        font-size="62"
+        font-size="56"
         font-weight="800"
         letter-spacing="-1.5"
         fill="#000000">Orbit</text>

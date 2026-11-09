@@ -30,14 +30,20 @@ tauri-plugin-log = "2"
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-window-state = "2.5.0"
 tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
 sysinfo = { version = "0.37.2", default-features = false, features = ["component", "system", "disk"] }
 orbit-core = { version = "0.1.0", path = "../crates/orbit-core" }
 xcap = "0.9.8"
 arboard = "3.7.0"
+# 剪贴板：OS 级事件监听（Windows WM_CLIPBOARDUPDATE）+ 多格式读取
+clipboard-rs = "0.3"
+rusqlite = { version = "0.41", features = ["bundled"] }
+sha2 = "0.10"
+regex = "1"
+base64 = "0.21"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
 enigo = "0.2"
-rdev = "0.5"
 
 # helper 二进制用（和主进程共享 sysinfo/serde），但 serde_json 主进程也需要所以全局有
