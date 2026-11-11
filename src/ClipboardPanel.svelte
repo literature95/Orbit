@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
+  import { runCommand } from './bus';
 
   type ClipItem = {
     id: number;
@@ -48,7 +48,7 @@
 
   async function refresh(): Promise<void> {
     try {
-      items = await invoke<ClipItem[]>('clip_list', {
+      items = await runCommand<ClipItem[]>('clipboard.list', {
         query: query.trim() || null,
         filter,
         limit: 200,
@@ -63,7 +63,7 @@
 
   async function toggleMonitor(): Promise<void> {
     try {
-      monitoring = await invoke<boolean>('clip_set_monitor', { enabled: !monitoring });
+      monitoring = await runCommand<boolean>('clipboard.set_monitor', { enabled: !monitoring });
       setStatus(monitoring ? '监听已恢复' : '监听已暂停');
     } catch (error) {
       setStatus(`切换失败：${String(error)}`);
@@ -72,7 +72,7 @@
 
   async function writeBack(item: ClipItem): Promise<void> {
     try {
-      await invoke('clip_write_back', { id: item.id });
+      await runCommand('clipboard.write_back', { id: item.id });
       await refresh();
       await closeWindow();
     } catch (error) {
@@ -83,7 +83,7 @@
   async function toggleFlag(item: ClipItem, field: 'pinned' | 'favorite'): Promise<void> {
     const next = !item[field];
     try {
-      await invoke(field === 'pinned' ? 'clip_set_pin' : 'clip_set_favorite', {
+      await runCommand(field === 'pinned' ? 'clipboard.set_pin' : 'clipboard.set_favorite', {
         id: item.id,
         value: next,
       });
@@ -95,7 +95,7 @@
 
   async function removeItem(item: ClipItem): Promise<void> {
     try {
-      await invoke('clip_delete', { id: item.id });
+      await runCommand('clipboard.delete', { id: item.id });
       await refresh();
     } catch (error) {
       setStatus(`删除失败：${String(error)}`);
@@ -112,7 +112,7 @@
     clearArmed = false;
     if (clearTimer) clearTimeout(clearTimer);
     try {
-      await invoke('clip_clear');
+      await runCommand('clipboard.clear');
       await refresh();
       setStatus('已清空普通条目');
     } catch (error) {
@@ -128,7 +128,7 @@
     previewItem = item;
     previewUrl = '';
     try {
-      previewUrl = await invoke<string>('clip_image_preview', { id: item.id });
+      previewUrl = await runCommand<string>('clipboard.image_preview', { id: item.id });
     } catch (error) {
       previewUrl = '';
       setStatus(`预览失败：${String(error)}`);
@@ -141,7 +141,7 @@
   }
 
   async function closeWindow(): Promise<void> {
-    try { await invoke('clip_close_window'); } catch { /* 忽略 */ }
+    try { await runCommand('clipboard.close_window'); } catch { /* 忽略 */ }
   }
 
   function rowKey(event: KeyboardEvent, item: ClipItem): void {
@@ -179,10 +179,10 @@
 
   onMount(() => {
     void refresh();
-    void invoke<boolean>('clip_get_monitor')
+    void runCommand<boolean>('clipboard.get_monitor')
       .then((value) => { monitoring = value; })
       .catch(() => { /* 忽略 */ });
-    void invoke<string>('clip_shortcut')
+    void runCommand<string>('clipboard.shortcut')
       .then((value) => { shortcutLabel = value; })
       .catch(() => { /* 忽略 */ });
     searchInput?.focus();
@@ -355,7 +355,10 @@
 <style>
   .clip-shell {
     position: absolute;
-    inset: 8px;
+    top: var(--orb-panel-inset);
+    left: var(--orb-panel-inset);
+    width: calc(var(--orb-clipboard-w) - var(--orb-panel-inset) - var(--orb-panel-inset));
+    height: calc(var(--orb-clipboard-h) - var(--orb-panel-inset) - var(--orb-panel-inset));
     display: flex;
     flex-direction: column;
     box-sizing: border-box;

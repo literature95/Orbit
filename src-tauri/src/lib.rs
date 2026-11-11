@@ -1,29 +1,72 @@
 use orbit_core::{
-    AuditLog, CommandRequest, CommandResponse, CommandStatus, ScreenshotRequest, command_catalog,
+    AuditLog, CommandRequest, CommandResponse, CommandStatus, DockPosition, PermissionState,
+    RegionFinishParams, RegionSelectionStart, SetupResult, SystemMetrics, WindowLayout, WindowSize,
 };
-use serde::Serialize;
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 use sysinfo::{Components, System};
 use tauri::Manager;
 use tauri::{
-    AppHandle, Emitter, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent,
+    AppHandle, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use xcap::Monitor;
 
+mod bus;
 mod clipboard;
+mod elevated;
 mod input_recorder;
 mod screenshot;
 
-const FLOATING_SIZE: (f64, f64) = (104.0, 104.0);
-const SIDE_SIZE: (f64, f64) = (54.0, 132.0);
-const NOTCH_SIZE: (f64, f64) = (320.0, 62.0);
+/// tauri.conf.json 只描述窗口初始尺寸；停靠/展开态尺寸集中在此，
+/// 由 `overlay.layout` 发布给前端，避免 Rust 与 CSS 各写一份数字。
+const SIDE_SIZE: WindowSize = WindowSize { width: 54.0, height: 132.0 };
+const NOTCH_SIZE: WindowSize = WindowSize { width: 320.0, height: 62.0 };
 /// 展开圆盘窗口：紧贴最大外圈（半径 132）并留出顶部提示、底部按钮的位置
-const EXPANDED_SIZE: (f64, f64) = (340.0, 340.0);
+const EXPANDED_SIZE: WindowSize = WindowSize { width: 340.0, height: 340.0 };
+/// 弹窗相对窗口的内边距：0 表示严格按配置尺寸铺满。
+const PANEL_INSET: f64 = 0.0;
 /// 贴近屏幕边缘多少像素内才吸附，避免大老远就触发停靠
 const EDGE_THRESHOLD: i32 = 24;
+
+/// 窗口尺寸的唯一发布点：初始尺寸读取 tauri.conf.json，状态尺寸取上面的常量。
+/// 找不到配置窗口时直接报错，不在代码里再抄一份兜底数字。
+pub(crate) fn layout_config(
+    manager: &impl tauri::Manager<tauri::Wry>,
+) -> Result<WindowLayout, String> {
+    let configured = |label: &str| -> Result<WindowSize, String> {
+        manager
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|window| window.label == label)
+            .map(|window| WindowSize {
+                width: window.width,
+                height: window.height,
+            })
+            .ok_or_else(|| format!("tauri.conf.json 缺少 {label} 窗口配置"))
+    };
+    Ok(WindowLayout {
+        floating: configured("main")?,
+        side: SIDE_SIZE,
+        notch: NOTCH_SIZE,
+        expanded: EXPANDED_SIZE,
+        clipboard: configured("clipboard")?,
+        selection: configured("selection")?,
+        panel_inset: PANEL_INSET,
+    })
+}
+
+/// 覆盖层当前状态使用的逻辑尺寸；前端由同一份 layout 注入 CSS 变量。
+fn overlay_size(layout: &WindowLayout, dock: DockPosition, expanded: bool) -> WindowSize {
+    match (dock, expanded) {
+        (DockPosition::Floating, false) => layout.floating,
+        (DockPosition::Left | DockPosition::Right, false) => layout.side,
+        (DockPosition::Top, false) => layout.notch,
+        (_, true) => layout.expanded,
+    }
+}
 
 /// 子进程一律不创建控制台窗口：OCR / 温度 / 录屏 / 转换调用外部程序时不再闪黑框。
 trait NoWindow {
@@ -44,48 +87,32 @@ impl NoWindow for std::process::Command {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum DockPosition {
-    #[default]
-    Floating,
-    Left,
-    Right,
-    Top,
-}
-
 #[derive(Clone, Copy)]
 struct OverlayLayout {
     dock: DockPosition,
     expanded: bool,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OverlaySnapshot {
-    dock: DockPosition,
-    expanded: bool,
-}
-
 #[derive(Default)]
 struct OverlayState(Mutex<OverlayLayout>);
-struct ElevatedToggle(pub Mutex<bool>); // 用户启用后才会拉 helper
+pub struct ElevatedToggle(pub Mutex<bool>); // 用户启用后才会拉 helper
 
-#[tauri::command]
-fn set_elevated_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+pub(crate) fn set_elevated_enabled_impl(
+    app: &AppHandle,
+    enabled: bool,
+) -> Result<bool, String> {
     if enabled {
         // 一次 UAC 拉起常驻 helper；已在运行则不重复弹。
-        start_elevated_watch()?;
+        elevated::start_watch().map_err(|error| error.message())?;
     } else {
-        stop_elevated_watch();
+        elevated::stop_watch();
     }
     *app.state::<ElevatedToggle>().0.lock().unwrap() = enabled;
     Ok(enabled)
 }
 
-#[tauri::command]
-fn get_elevated_status(app: AppHandle) -> bool {
-    *app.state::<ElevatedToggle>().0.lock().unwrap()
+pub(crate) fn get_elevated_status_impl(app: &AppHandle) -> bool {
+    *app.state::<ElevatedToggle>().0.lock().unwrap() || elevated::is_watch_running()
 }
 
 impl Default for OverlayLayout {
@@ -97,39 +124,8 @@ impl Default for OverlayLayout {
     }
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SystemMetrics {
-    cpu_usage: f32,
-    cpu_temperature: Option<f32>,
-    game_fps: Option<u32>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SetupResult {
-    permissions: HashMap<String, PermissionState>,
-    autostart_configured: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum PermissionState {
-    Unknown,
-}
-
-#[tauri::command]
-fn complete_first_run_setup(app: AppHandle) -> Result<SetupResult, String> {
-    set_autostart_enabled(app, true)
-}
-
-#[tauri::command]
-fn get_setup_status(app: AppHandle) -> Result<SetupResult, String> {
-    setup_result(&app)
-}
-
-#[tauri::command]
-fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<SetupResult, String> {
+/// 登录启动的真实开关逻辑：总线处理器与单元测试共用，避免两套行为漂移。
+pub(crate) fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<SetupResult, String> {
     let autostart = app.autolaunch();
     if enabled {
         autostart.enable().map_err(|error| error.to_string())?;
@@ -137,7 +133,7 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<SetupResult, S
         autostart.disable().map_err(|error| error.to_string())?;
     }
 
-    let result = setup_result(&app)?;
+    let result = setup_result(app)?;
     if result.autostart_configured != enabled {
         return Err(if enabled {
             "登录启动项注册后仍处于关闭状态。".to_string()
@@ -148,7 +144,7 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<SetupResult, S
     Ok(result)
 }
 
-fn setup_result(app: &AppHandle) -> Result<SetupResult, String> {
+pub(crate) fn setup_result(app: &AppHandle) -> Result<SetupResult, String> {
     let permissions = [
         ("screen-capture", PermissionState::Unknown),
         ("accessibility-input", PermissionState::Unknown),
@@ -169,67 +165,27 @@ fn setup_result(app: &AppHandle) -> Result<SetupResult, String> {
 
 #[tauri::command]
 fn get_command_catalog() -> Result<Vec<orbit_core::CommandSpec>, String> {
-    command_catalog().map_err(|error| error.to_string())
+    // 目录直接来自总线注册表：契约与实际可路由命令永远一致。
+    let mut specs: Vec<orbit_core::CommandSpec> = bus::registry()
+        .values()
+        .map(|entry| entry.spec.clone())
+        .collect();
+    specs.sort_by(|a, b| a.id.cmp(b.id));
+    Ok(specs)
 }
 
 #[tauri::command]
 async fn execute_command(
+    app: AppHandle,
     audit: tauri::State<'_, AuditLog>,
     request: CommandRequest,
 ) -> Result<CommandResponse, String> {
-    execute_request(audit.inner().clone(), request).await
+    Ok(bus::execute(app, audit.inner().clone(), request).await)
 }
 
-async fn execute_request(
-    audit: AuditLog,
-    request: CommandRequest,
-) -> Result<CommandResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let started = Instant::now();
-        let command_id = request.command_id.clone();
-        let result = if command_id == "screenshot.capture" {
-            serde_json::from_value::<ScreenshotRequest>(request.params.clone())
-                .map_err(|error| error.to_string())
-                .and_then(screenshot::capture_to_clipboard)
-        } else {
-            Err(format!("未知命令：{command_id}"))
-        };
-        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let status = if result.is_ok() {
-            CommandStatus::Ok
-        } else {
-            CommandStatus::Error
-        };
-        audit
-            .record(&command_id, &request.params, status, duration_ms)
-            .map_err(|error| format!("命令执行结果无法写入审计日志：{error}"))?;
-
-        let (data, error) = match result {
-            Ok(data) => (Some(data), None),
-            Err(error) => (None, Some(error)),
-        };
-        Ok(CommandResponse {
-            command_id,
-            status,
-            data,
-            error,
-            duration_ms,
-        })
-    })
-    .await
-    .map_err(|error| format!("命令工作线程异常退出：{error}"))?
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RegionSelectionStart {
-    monitor_id: u32,
-}
-
-#[tauri::command]
-fn start_region_selection(
-    app: AppHandle,
-    state: tauri::State<'_, OverlayState>,
+pub(crate) fn start_region_selection_impl(
+    app: &AppHandle,
+    layout: OverlayLayout,
 ) -> Result<(), String> {
     let main = app
         .get_webview_window("main")
@@ -262,12 +218,12 @@ fn start_region_selection(
     selection
         .set_position(PhysicalPosition::new(position.x, position.y))
         .map_err(|error| error.to_string())?;
-    selection
-        .emit(
-            "region-selection-start",
-            RegionSelectionStart { monitor_id },
-        )
-        .map_err(|error| error.to_string())?;
+    bus::emit(
+        &app,
+        "region-selection-start",
+        &RegionSelectionStart { monitor_id },
+    )
+    .map_err(|error| error.to_string())?;
 
     main.hide().map_err(|error| error.to_string())?;
     if let Err(error) = selection.show() {
@@ -276,7 +232,7 @@ fn start_region_selection(
     }
     if let Err(error) = selection.set_focus() {
         let _ = selection.hide();
-        return match restore_main_overlay(&app, state.inner()) {
+        return match restore_main_overlay(app, layout) {
             Ok(()) => Err(error.to_string()),
             Err(restore_error) => Err(format!(
                 "无法聚焦区域截图窗口：{error}；恢复 Orbit 主窗口失败：{restore_error}"
@@ -286,26 +242,26 @@ fn start_region_selection(
     Ok(())
 }
 
-fn restore_main_overlay(app: &AppHandle, state: &OverlayState) -> Result<(), String> {
+fn restore_main_overlay(app: &AppHandle, layout: OverlayLayout) -> Result<(), String> {
     let main = app
         .get_webview_window("main")
         .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
-    let layout = *state.0.lock().map_err(|error| error.to_string())?;
     set_overlay_layout(&main, layout.dock, layout.expanded)?;
     main.show().map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-async fn finish_region_selection(
-    app: AppHandle,
-    audit: tauri::State<'_, AuditLog>,
-    state: tauri::State<'_, OverlayState>,
-    monitor_id: u32,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
+pub(crate) async fn finish_region_selection_impl(
+    app: &AppHandle,
+    layout: OverlayLayout,
+    params: RegionFinishParams,
 ) -> Result<CommandResponse, String> {
+    let RegionFinishParams {
+        monitor_id,
+        x,
+        y,
+        width,
+        height,
+    } = params;
     let selection = app
         .get_webview_window("selection")
         .ok_or_else(|| "找不到区域截图窗口。".to_string())?;
@@ -321,28 +277,37 @@ async fn finish_region_selection(
             "height": height
         }),
     };
-    let result = execute_request(audit.inner().clone(), request).await;
-    let restore = restore_main_overlay(&app, state.inner());
-    match (result, restore) {
-        (Ok(response), Ok(())) => Ok(response),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(format!("截图已处理，但无法恢复 Orbit 主窗口：{error}")),
-        (Err(capture_error), Err(restore_error)) => Err(format!(
-            "{capture_error}；恢复 Orbit 主窗口失败：{restore_error}"
+    let audit = app.state::<AuditLog>().inner().clone();
+    let response = bus::execute(app.clone(), audit, request).await;
+    let restore = restore_main_overlay(app, layout);
+    let capture_error = || {
+        response
+            .error
+            .clone()
+            .unwrap_or_else(|| "截图命令执行失败".to_string())
+    };
+    match (response.status, restore) {
+        (CommandStatus::Ok, Ok(())) => Ok(response),
+        (CommandStatus::Ok, Err(error)) => {
+            Err(format!("截图已处理，但无法恢复 Orbit 主窗口：{error}"))
+        }
+        (CommandStatus::Error, Ok(())) => Err(capture_error()),
+        (CommandStatus::Error, Err(restore_error)) => Err(format!(
+            "{}；恢复 Orbit 主窗口失败：{restore_error}",
+            capture_error()
         )),
     }
 }
 
-#[tauri::command]
-fn cancel_region_selection(
-    app: AppHandle,
-    state: tauri::State<'_, OverlayState>,
+pub(crate) fn cancel_region_selection_impl(
+    app: &AppHandle,
+    layout: OverlayLayout,
 ) -> Result<(), String> {
     let selection = app
         .get_webview_window("selection")
         .ok_or_else(|| "找不到区域截图窗口。".to_string())?;
     selection.hide().map_err(|error| error.to_string())?;
-    restore_main_overlay(&app, state.inner())
+    restore_main_overlay(app, layout)
 }
 
 fn monitor_bounds(window: &WebviewWindow) -> Result<(i32, i32, i32, i32), String> {
@@ -414,16 +379,10 @@ fn set_overlay_layout(
     let center_x = position.x + current_size.width as i32 / 2;
     let center_y = position.y + current_size.height as i32 / 2;
     let (monitor_left, monitor_top, monitor_right, monitor_bottom) = monitor_bounds(window)?;
-    let logical_size = match (dock, expanded) {
-        (DockPosition::Floating, false) => FLOATING_SIZE,
-        (DockPosition::Floating, true) => EXPANDED_SIZE,
-        (DockPosition::Left | DockPosition::Right, false) => SIDE_SIZE,
-        (DockPosition::Top, false) => NOTCH_SIZE,
-        (DockPosition::Left | DockPosition::Right, true) => EXPANDED_SIZE,
-        (DockPosition::Top, true) => EXPANDED_SIZE,
-    };
-    let target_width = (logical_size.0 * scale_factor).round() as u32;
-    let target_height = (logical_size.1 * scale_factor).round() as u32;
+    let layout = layout_config(window)?;
+    let logical_size = overlay_size(&layout, dock, expanded);
+    let target_width = (logical_size.width * scale_factor).round() as u32;
+    let target_height = (logical_size.height * scale_factor).round() as u32;
     let max_x = monitor_right - target_width as i32;
     let max_y = monitor_bottom - target_height as i32;
     let target_x = match dock {
@@ -444,34 +403,60 @@ fn set_overlay_layout(
     .clamp(monitor_top, max_y.max(monitor_top));
 
     window
-        .set_size(tauri::LogicalSize::new(logical_size.0, logical_size.1))
+        .set_size(tauri::LogicalSize::new(
+            logical_size.width,
+            logical_size.height,
+        ))
         .map_err(|error| error.to_string())?;
     window
         .set_position(PhysicalPosition::new(target_x, target_y))
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-fn dock_overlay(
-    window: WebviewWindow,
-    state: tauri::State<'_, OverlayState>,
-) -> Result<OverlaySnapshot, String> {
-    let dock = dock_position(&window)?;
-    let mut layout = state.0.lock().map_err(|error| error.to_string())?;
-    if layout.dock != dock {
-        layout.dock = dock;
-        layout.expanded = false;
-    }
-    set_overlay_layout(&window, layout.dock, layout.expanded)?;
-    Ok(OverlaySnapshot {
-        dock: layout.dock,
-        expanded: layout.expanded,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{DockPosition, determine_dock_position};
+
+    #[test]
+    fn overlay_size_follows_layout_states() {
+        use super::{overlay_size, WindowLayout, WindowSize};
+        const fn size(width: f64, height: f64) -> WindowSize {
+            WindowSize { width, height }
+        }
+        let layout = WindowLayout {
+            floating: size(104.0, 104.0),
+            side: size(54.0, 132.0),
+            notch: size(320.0, 62.0),
+            expanded: size(340.0, 340.0),
+            clipboard: size(420.0, 560.0),
+            selection: size(1.0, 1.0),
+            panel_inset: 0.0,
+        };
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Floating, false),
+            size(104.0, 104.0)
+        );
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Left, false),
+            size(54.0, 132.0)
+        );
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Right, false),
+            size(54.0, 132.0)
+        );
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Top, false),
+            size(320.0, 62.0)
+        );
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Floating, true),
+            size(340.0, 340.0)
+        );
+        assert_eq!(
+            overlay_size(&layout, DockPosition::Top, true),
+            size(340.0, 340.0)
+        );
+    }
 
     #[test]
     fn top_edge_takes_priority_at_screen_corners() {
@@ -525,80 +510,30 @@ mod tests {
         assert!(total_mb > 0, "total_mb={total_mb}");
         assert!(avail_mb <= total_mb, "avail={avail_mb} total={total_mb}");
     }
-}
 
-#[tauri::command]
-fn set_overlay_open(
-    window: WebviewWindow,
-    state: tauri::State<'_, OverlayState>,
-    open: bool,
-) -> Result<(), String> {
-    let mut layout = state.0.lock().map_err(|error| error.to_string())?;
-    set_overlay_layout(&window, layout.dock, open)?;
-    layout.expanded = open;
-    Ok(())
-}
-
-#[tauri::command]
-fn quit_app(app: AppHandle) {
-    app.exit(0);
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SystemInfo {
-    os_name: String,
-    os_version: String,
-    screen_width: u32,
-    screen_height: u32,
-    scale_factor: f64,
-    total_memory_mb: u64,
-    available_memory_mb: u64,
-}
-
-#[tauri::command]
-fn get_system_info(window: WebviewWindow) -> Result<SystemInfo, String> {
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| e.to_string())?
-        .or(window.primary_monitor().map_err(|e| e.to_string())?)
-        .ok_or_else(|| "无法获取屏幕信息".to_string())?;
-    let size = monitor.size();
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    // 获取 OS 版本（Tauri 2 内置不可用，用 sysinfo 版本或硬编码）
-    let os_version = sysinfo::System::kernel_version()
-        .unwrap_or_else(|| "unknown".to_string());
-    Ok(SystemInfo {
-        os_name: std::env::consts::OS.to_string(),
-        os_version,
-        screen_width: size.width,
-        screen_height: size.height,
-        scale_factor: scale,
-        total_memory_mb: sys.total_memory() / 1024,
-        available_memory_mb: sys.available_memory() / 1024,
-    })
+    #[test]
+    fn monitor_snapshot_exposes_per_core_usage() {
+        let dash = super::DashState::new();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (cpu, cores, total_mb, _) = dash.snapshot();
+        assert!(
+            cpu.is_finite() && (0.0..=100.0).contains(&cpu),
+            "cpu={cpu}"
+        );
+        assert!(!cores.is_empty(), "没有读到 CPU 核心");
+        assert!(
+            cores.iter().all(|usage| usage.is_finite() && (0.0..=100.0).contains(usage)),
+            "核心占用越界：{cores:?}"
+        );
+        assert!(total_mb > 0, "total_mb={total_mb}");
+    }
 }
 
 // ============ 灵动岛仪表盘 ============
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DashInfo {
-    cpu_percent: f32,
-    memory_used_percent: f32,
-    memory_used_mb: u64,
-    memory_total_mb: u64,
-    uptime_secs: u64,
-    time_now: String,
-    clipboard_count: usize,
-    temperature_c: Option<f32>,
-}
-
 /// CPU 使用率是两次采样之间的差值，必须复用同一个 System；
 /// 每次调用都新建实例只能拿到首次采样的垃圾值（常见 0% 或 100%）。
-struct DashState(Mutex<System>);
+pub struct DashState(Mutex<System>);
 
 impl DashState {
     fn new() -> Self {
@@ -608,147 +543,27 @@ impl DashState {
     }
 
     /// 返回 (CPU 占用百分比, 总内存 MB, 可用内存 MB)。
-    fn sample(&self) -> (f32, u64, u64) {
+    pub fn sample(&self) -> (f32, u64, u64) {
+        let (cpu, _, total_mb, avail_mb) = self.snapshot();
+        (cpu, total_mb, avail_mb)
+    }
+
+    /// 返回 (CPU 总占用, 每核占用, 总内存 MB, 可用内存 MB)。
+    pub fn snapshot(&self) -> (f32, Vec<f32>, u64, u64) {
         let mut sys = self.0.lock().unwrap();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
+        let per_core = sys.cpus().iter().map(|cpu| cpu.cpu_usage()).collect();
         (
             sys.global_cpu_usage(),
+            per_core,
             sys.total_memory() / 1024,
             sys.available_memory() / 1024,
         )
     }
 }
 
-// 管理员增强采用「一次 UAC、常驻读取」：helper --watch 每 5 秒把温度写入
-// 共享 JSON，主进程只读文件，避免每次仪表盘刷新都弹 UAC。
-fn helper_flag_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("orbit_helper_run.flag")
-}
-
-fn helper_live_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("orbit_helper_live.json")
-}
-
-fn elevated_watch_running() -> bool {
-    if !helper_flag_path().exists() {
-        return false;
-    }
-    std::fs::metadata(helper_live_path())
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|age| age < std::time::Duration::from_secs(30))
-        .unwrap_or(false)
-}
-
-fn start_elevated_watch() -> Result<(), String> {
-    if elevated_watch_running() {
-        return Ok(());
-    }
-    let exe = std::env::current_exe().map_err(|e| format!("exe 路径获取失败：{e}"))?;
-    let helper_path = exe
-        .parent()
-        .ok_or_else(|| "找不到 exe 目录".to_string())?
-        .join("orbit-elevated-helper.exe");
-    if !helper_path.exists() {
-        return Err(format!("helper 不存在：{}", helper_path.display()));
-    }
-
-    let flag = helper_flag_path();
-    let out = helper_live_path();
-    std::fs::write(&flag, std::process::id().to_string()).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&out);
-
-    // CreateProcess 不能 runas，必须走 ShellExecute（PowerShell -Verb RunAs）。
-    // 不带 -Wait：helper 常驻，UAC 只在本次启动时弹一次。
-    let ps = format!(
-        "Start-Process -FilePath '{}' -ArgumentList '--watch \"{}\" \"{}\" {}' -Verb RunAs -WindowStyle Hidden",
-        helper_path.to_string_lossy().replace("'", "''"),
-        flag.to_string_lossy().replace("'", "''"),
-        out.to_string_lossy().replace("'", "''"),
-        std::process::id(),
-    );
-    std::process::Command::new("powershell.exe")
-        .no_window()
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("无法拉起管理员 helper：{e}"))?;
-    Ok(())
-}
-
-fn stop_elevated_watch() {
-    // 删标志文件后 helper 会在下一个循环（≤5 秒）自行退出并清理输出。
-    let _ = std::fs::remove_file(helper_flag_path());
-}
-
-fn read_live_temperature() -> Option<f32> {
-    let meta = std::fs::metadata(helper_live_path()).ok()?;
-    let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > std::time::Duration::from_secs(30) {
-        return None;
-    }
-    let raw = std::fs::read_to_string(helper_live_path()).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("temperature_c")?
-        .as_f64()
-        .map(|t| t as f32)
-}
-
-#[tauri::command]
-fn get_dash_info(app: AppHandle, dash: tauri::State<'_, DashState>) -> Result<DashInfo, String> {
-    let (cpu_percent, total_mem, avail_mem) = dash.sample();
-
-    let used_mb = total_mem.saturating_sub(avail_mem);
-    let mem_percent = if total_mem > 0 {
-        (used_mb as f32 / total_mem as f32) * 100.0
-    } else {
-        0.0
-    };
-
-    let uptime_secs = System::uptime();
-    let time_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string());
-
-    // 只读常驻 helper 写的共享文件，绝不在此触发 UAC。
-    let enabled = *app.state::<ElevatedToggle>().0.lock().unwrap();
-    let temperature_c = if enabled { read_live_temperature() } else { None };
-
-    Ok(DashInfo {
-        cpu_percent,
-        memory_used_percent: mem_percent,
-        memory_used_mb: used_mb,
-        memory_total_mb: total_mem,
-        uptime_secs,
-        time_now,
-        clipboard_count: app
-            .try_state::<clipboard::ClipboardState>()
-            .map(|state| state.count())
-            .unwrap_or(0),
-        temperature_c,
-    })
-}
-
-// ============ 剪贴板 ============
-
-#[tauri::command]
-fn clip_read() -> Result<String, String> {
-    let mut board = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    board.get_text().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn clip_write(state: tauri::State<'_, clipboard::ClipboardState>, text: String) -> Result<(), String> {
-    state.suppress_text_write(&text);
-    let mut board = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    board.set_text(text).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// 管理员 helper 的文件握手与错误映射见 elevated.rs。
 
 // ============ 录屏 ============
 
@@ -776,13 +591,12 @@ struct RecordHandle {
     stdin: Option<std::process::ChildStdin>,
 }
 
-#[tauri::command]
-fn record_start(app: AppHandle) -> Result<String, String> {
+pub(crate) fn record_start_impl(app: &AppHandle) -> Result<String, String> {
     if app.state::<RecordState>().0.lock().unwrap().is_some() {
         return Err("已经在录制中".to_string());
     }
     // 找 FFmpeg（sidecar 或 PATH）
-    let ffmpeg = resolve_ffmpeg(&app);
+    let ffmpeg = resolve_ffmpeg(app);
 
     // 生成输出路径：桌面/Orbit/orbit_rec_*.mp4
     let home = std::env::var("USERPROFILE")
@@ -798,7 +612,16 @@ fn record_start(app: AppHandle) -> Result<String, String> {
     );
     let path = dir.join(&filename);
     let path_str = path.to_string_lossy().to_string();
+    let handle = spawn_ffmpeg_recording(&ffmpeg, &path_str)?;
+    *app.state::<RecordState>().0.lock().unwrap() = Some(handle);
+    Ok(path_str)
+}
 
+/// 启动 FFmpeg gdigrab 全屏录制，返回句柄；与测试共用。
+fn spawn_ffmpeg_recording(
+    ffmpeg: &std::path::Path,
+    path_str: &str,
+) -> Result<RecordHandle, String> {
     // FFmpeg gdigrab 全屏录制，H264 编码，4Mbps
     let args = [
         "-y",
@@ -810,10 +633,10 @@ fn record_start(app: AppHandle) -> Result<String, String> {
         "-preset", "veryfast",
         "-b:v", "4M",
         "-pix_fmt", "yuv420p",
-        path_str.as_str(),
+        path_str,
     ];
 
-    let mut child = std::process::Command::new(&ffmpeg)
+    let mut child = std::process::Command::new(ffmpeg)
         .no_window()
         .args(&args)
         .stdin(std::process::Stdio::piped())
@@ -828,14 +651,41 @@ fn record_start(app: AppHandle) -> Result<String, String> {
             }
         })?;
     let stdin = child.stdin.take();
-
-    let state = app.state::<RecordState>();
-    *state.0.lock().unwrap() = Some(RecordHandle { path: path_str.clone(), child, stdin });
-    Ok(path_str)
+    Ok(RecordHandle {
+        path: path_str.to_string(),
+        child,
+        stdin,
+    })
 }
 
-#[tauri::command]
-async fn record_stop(app: AppHandle) -> Result<Option<String>, String> {
+/// 正常收尾：向 stdin 写 q 让 FFmpeg 写完 mp4 尾部，超时才强杀。
+fn finish_recording(handle: RecordHandle) -> Result<Option<String>, String> {
+    use std::io::Write;
+    let mut handle = handle;
+    if let Some(mut stdin) = handle.stdin.take() {
+        let _ = stdin.write_all(b"q");
+        let _ = stdin.flush();
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        match handle.child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // 兜底：FFmpeg 无响应时才强杀（此时尾部可能不完整）。
+                    let _ = handle.child.kill();
+                    let _ = handle.child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(Some(handle.path))
+}
+
+pub(crate) async fn record_stop_impl(app: &AppHandle) -> Result<Option<String>, String> {
     let handle = app
         .state::<RecordState>()
         .0
@@ -844,34 +694,9 @@ async fn record_stop(app: AppHandle) -> Result<Option<String>, String> {
         .take()
         .ok_or_else(|| "没有正在录制的会话".to_string())?;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        use std::io::Write;
-        let mut handle = handle;
-        // 向 FFmpeg stdin 写 q：flush 缓冲并正常写完 mp4 尾部后再退出。
-        if let Some(mut stdin) = handle.stdin.take() {
-            let _ = stdin.write_all(b"q");
-            let _ = stdin.flush();
-        }
-        let deadline = Instant::now() + std::time::Duration::from_secs(8);
-        loop {
-            match handle.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        // 兜底：FFmpeg 无响应时才强杀（此时尾部可能不完整）。
-                        let _ = handle.child.kill();
-                        let _ = handle.child.wait();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(Some(handle.path))
-    })
-    .await
-    .map_err(|error| format!("录屏停止线程异常退出：{error}"))?
+    tauri::async_runtime::spawn_blocking(move || finish_recording(handle))
+        .await
+        .map_err(|error| format!("录屏停止线程异常退出：{error}"))?
 }
 
 // ============ OCR ============
@@ -897,14 +722,7 @@ fn current_capture_monitor(window: &WebviewWindow) -> Result<Monitor, String> {
         .ok_or_else(|| "无法将窗口显示器映射到截图设备。".to_string())
 }
 
-#[tauri::command]
-async fn ocr_image(image_path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || ocr_image_blocking(&image_path))
-        .await
-        .map_err(|error| format!("OCR 工作线程异常退出：{error}"))?
-}
-
-fn ocr_image_blocking(image_path: &str) -> Result<String, String> {
+pub(crate) fn ocr_image_blocking(image_path: &str) -> Result<String, String> {
     // Windows.Media.Ocr 通过 PowerShell 调用（Windows 10+ 内置）。
     // 路径经环境变量传入，不做字符串内插，避免引号破坏脚本或注入。
     // Await 用反射调用泛型 AsTask：PowerShell 直接调用时无法对 __ComObject
@@ -954,8 +772,8 @@ $result.Text
     }
 }
 
-#[tauri::command]
-async fn ocr_current_screen(window: WebviewWindow) -> Result<String, String> {
+pub(crate) async fn ocr_current_screen_impl(window: &WebviewWindow) -> Result<String, String> {
+    let window = window.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // 截取悬浮球当前所在显示器（多显示器环境下不再固定截第一块）。
         let monitor = current_capture_monitor(&window)?;
@@ -995,8 +813,7 @@ impl Drop for TempFileGuard {
 
 struct KbRecordState(Mutex<Option<input_recorder::RecordingSession>>);
 
-#[tauri::command]
-fn kb_record_start(app: AppHandle) -> Result<(), String> {
+pub(crate) fn kb_record_start_impl(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<KbRecordState>();
     let mut guard = state.0.lock().unwrap();
     if guard.is_some() {
@@ -1006,8 +823,7 @@ fn kb_record_start(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn kb_record_stop(app: AppHandle) -> Result<Vec<input_recorder::KbEvent>, String> {
+pub(crate) fn kb_record_stop_impl(app: &AppHandle) -> Result<Vec<input_recorder::KbEvent>, String> {
     let session = app
         .state::<KbRecordState>()
         .0
@@ -1033,9 +849,8 @@ fn kb_record_stop(app: AppHandle) -> Result<Vec<input_recorder::KbEvent>, String
 
 const CONVERT_FORMATS: &[&str] = &["mp3", "wav", "mp4", "gif", "webp"];
 
-#[tauri::command]
-async fn convert_format(
-    app: AppHandle,
+pub(crate) async fn convert_format_impl(
+    app: &AppHandle,
     input_path: String,
     output_path: String,
     format: String,
@@ -1046,51 +861,62 @@ async fn convert_format(
             CONVERT_FORMATS.join(" / ")
         ));
     }
+    let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let ffmpeg = resolve_ffmpeg(&app);
-        let mut output = output_path.clone();
-        if !output.to_lowercase().ends_with(&format!(".{format}")) {
-            output = format!("{}.{}", output.trim_end_matches('.'), format);
-        }
-        let out_path = std::path::Path::new(&output);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-
-        let args: Vec<&str> = match format.as_str() {
-            "mp3" => vec!["-y", "-i", &input_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", &output],
-            "wav" => vec!["-y", "-i", &input_path, "-vn", "-acodec", "pcm_s16le", &output],
-            "mp4" => vec!["-y", "-i", &input_path, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", &output],
-            "gif" => vec!["-y", "-i", &input_path, "-vf", "fps=12,scale=480:-1", &output],
-            "webp" => vec!["-y", "-i", &input_path, "-vf", "fps=15", "-loop", "0", &output],
-            _ => vec!["-y", "-i", &input_path, &output],
-        };
-
-        let converted = std::process::Command::new(&ffmpeg)
-            .no_window()
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "找不到 ffmpeg。请安装 ffmpeg 并加入 PATH，或设置 FFMPEG_PATH 环境变量。".to_string()
-                } else {
-                    format!("FFmpeg 启动失败：{}", e)
-                }
-            })?;
-
-        if converted.status.success() {
-            Ok(output)
-        } else {
-            let stderr = String::from_utf8_lossy(&converted.stderr);
-            let chars: Vec<char> = stderr.chars().collect();
-            let tail: String = chars[chars.len().saturating_sub(400)..].iter().collect();
-            Err(format!("转换失败（退出码：{:?}）：{}", converted.status.code(), tail.trim()))
-        }
+        convert_with_ffmpeg(&ffmpeg, &input_path, &output_path, &format)
     })
     .await
     .map_err(|error| format!("转换工作线程异常退出：{error}"))?
+}
+
+/// 实际执行转换；与测试共用，便于单独验证 ffmpeg 参数与输出路径。
+fn convert_with_ffmpeg(
+    ffmpeg: &std::path::Path,
+    input_path: &str,
+    output_path: &str,
+    format: &str,
+) -> Result<String, String> {
+    let mut output = output_path.to_string();
+    if !output.to_lowercase().ends_with(&format!(".{format}")) {
+        output = format!("{}.{}", output.trim_end_matches('.'), format);
+    }
+    let out_path = std::path::Path::new(&output);
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let args: Vec<&str> = match format {
+        "mp3" => vec!["-y", "-i", input_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", &output],
+        "wav" => vec!["-y", "-i", input_path, "-vn", "-acodec", "pcm_s16le", &output],
+        "mp4" => vec!["-y", "-i", input_path, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", &output],
+        "gif" => vec!["-y", "-i", input_path, "-vf", "fps=12,scale=480:-1", &output],
+        "webp" => vec!["-y", "-i", input_path, "-vf", "fps=15", "-loop", "0", &output],
+        _ => vec!["-y", "-i", input_path, &output],
+    };
+
+    let converted = std::process::Command::new(ffmpeg)
+        .no_window()
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "找不到 ffmpeg。请安装 ffmpeg 并加入 PATH，或设置 FFMPEG_PATH 环境变量。".to_string()
+            } else {
+                format!("FFmpeg 启动失败：{}", e)
+            }
+        })?;
+
+    if converted.status.success() {
+        Ok(output)
+    } else {
+        let stderr = String::from_utf8_lossy(&converted.stderr);
+        let chars: Vec<char> = stderr.chars().collect();
+        let tail: String = chars[chars.len().saturating_sub(400)..].iter().collect();
+        Err(format!("转换失败（退出码：{:?}）：{}", converted.status.code(), tail.trim()))
+    }
 }
 
 /// 在**窗口创建之前**注册所有后端状态。
@@ -1141,43 +967,8 @@ pub fn run() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
-            complete_first_run_setup,
-            get_setup_status,
-            set_autostart_enabled,
             get_command_catalog,
-            execute_command,
-            start_region_selection,
-            finish_region_selection,
-            cancel_region_selection,
-            dock_overlay,
-            set_overlay_open,
-            quit_app,
-            get_system_info,
-            get_dash_info,
-            set_elevated_enabled,
-            get_elevated_status,
-            clip_read,
-            clip_write,
-            clipboard::clip_list,
-            clipboard::clip_count,
-            clipboard::clip_write_back,
-            clipboard::clip_set_pin,
-            clipboard::clip_set_favorite,
-            clipboard::clip_delete,
-            clipboard::clip_clear,
-            clipboard::clip_set_monitor,
-            clipboard::clip_get_monitor,
-            clipboard::clip_open_window,
-            clipboard::clip_close_window,
-            clipboard::clip_image_preview,
-            clipboard::clip_shortcut,
-            record_start,
-            record_stop,
-            ocr_image,
-            ocr_current_screen,
-            kb_record_start,
-            kb_record_stop,
-            convert_format
+            execute_command
         ])
         // 剪贴板窗口失焦自动隐藏：延迟 140ms 复查，规避 Windows 焦点切换抖动。
         .on_window_event(|window, event| {
@@ -1267,9 +1058,10 @@ pub fn run() {
                         })
                         .filter_map(|component| component.temperature())
                         .max_by(f32::total_cmp);
-                    if let Err(error) = app_handle.emit(
+                    if let Err(error) = bus::emit(
+                        &app_handle,
                         "system-metrics",
-                        SystemMetrics {
+                        &SystemMetrics {
                             cpu_usage: system.global_cpu_usage(),
                             cpu_temperature,
                             game_fps: None,
@@ -1301,7 +1093,7 @@ pub fn run() {
         .run(|_app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 // 通知常驻 helper 退出；崩溃场景由 helper 的父进程存活检查兜底。
-                stop_elevated_watch();
+                elevated::stop_watch();
             }
         });
 }
@@ -1321,4 +1113,122 @@ fn disable_window_transitions(window: &WebviewWindow) -> Result<(), String> {
         )
     }
     .map_err(|error| error.to_string())
+}
+
+/// 重路径命令的最小实机冒烟：只用真实系统 API，不依赖窗口与 IPC。
+#[cfg(test)]
+mod smoke {
+    use super::*;
+    use xcap::Monitor;
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("orbit-smoke");
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        dir.join(name)
+    }
+
+    #[test]
+    fn record_start_stop_produces_video() {
+        if !ffmpeg_available() {
+            eprintln!("跳过：未找到 ffmpeg");
+            return;
+        }
+        let path = temp_path("record-smoke.mp4");
+        let path_str = path.to_string_lossy().to_string();
+        let handle = spawn_ffmpeg_recording(std::path::Path::new("ffmpeg"), &path_str)
+            .expect("启动录制失败");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let stopped = finish_recording(handle).expect("停止录制失败");
+        assert_eq!(stopped.as_deref(), Some(path_str.as_str()));
+        let size = std::fs::metadata(&path).expect("录制文件不存在").len();
+        assert!(size > 0, "录制文件为空");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn create_text_png(name: &str) -> std::path::PathBuf {
+        let path = temp_path(name);
+        let script = r#"
+Add-Type -AssemblyName System.Drawing
+$bmp = New-Object System.Drawing.Bitmap 800,200
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::White)
+$font = New-Object System.Drawing.Font('Arial',64,[System.Drawing.FontStyle]::Bold)
+$g.DrawString('ORBIT 123', $font, [System.Drawing.Brushes]::Black, 20, 50)
+$bmp.Save($env:ORBIT_SMOKE_PNG, [System.Drawing.Imaging.ImageFormat]::Png)
+"#;
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("ORBIT_SMOKE_PNG", &path)
+            .status()
+            .expect("启动 PowerShell 失败");
+        assert!(status.success(), "生成测试图片失败");
+        path
+    }
+
+    #[test]
+    fn ocr_image_reads_synthetic_text() {
+        let path = create_text_png("ocr-smoke.png");
+        let text = ocr_image_blocking(&path.to_string_lossy()).expect("OCR 失败");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.to_uppercase().contains("ORBIT"),
+            "OCR 未识别出测试文字：{text:?}"
+        );
+    }
+
+    #[test]
+    fn ocr_current_screen_pipeline_captures_primary_screen() {
+        let monitor = Monitor::all().expect("枚举显示器失败").remove(0);
+        let image = monitor.capture_image().expect("截取屏幕失败");
+        let path = temp_path("ocr-screen-smoke.png");
+        image.save(&path).expect("保存截图失败");
+        let text = ocr_image_blocking(&path.to_string_lossy()).expect("屏幕 OCR 失败");
+        let _ = std::fs::remove_file(&path);
+        // 屏幕内容不可控，只要求整条链路可执行并返回文本。
+        assert!(text.len() < 1_000_000);
+    }
+
+    #[test]
+    fn convert_tone_to_mp3() {
+        if !ffmpeg_available() {
+            eprintln!("跳过：未找到 ffmpeg");
+            return;
+        }
+        let input = temp_path("convert-smoke.wav");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.3",
+                &input.to_string_lossy(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("生成测试音频失败");
+        assert!(status.success(), "生成测试音频失败");
+
+        let output = convert_with_ffmpeg(
+            std::path::Path::new("ffmpeg"),
+            &input.to_string_lossy(),
+            &temp_path("convert-smoke").to_string_lossy(),
+            "mp3",
+        )
+        .expect("转换失败");
+        assert!(output.ends_with(".mp3"), "输出扩展名不正确：{output}");
+        let size = std::fs::metadata(&output).expect("转换文件不存在").len();
+        assert!(size > 0, "转换文件为空");
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
 }

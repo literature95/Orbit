@@ -1,4 +1,19 @@
 :root {
+  /* 窗口尺寸兜底：overlay.layout 返回配置后由 App.svelte 覆盖；值须与 tauri.conf.json / LayoutConfig 一致 */
+  --orb-floating-w: 104px;
+  --orb-floating-h: 104px;
+  --orb-side-w: 54px;
+  --orb-side-h: 132px;
+  --orb-notch-w: 320px;
+  --orb-notch-h: 62px;
+  --orb-expanded-w: 340px;
+  --orb-expanded-h: 340px;
+  --orb-clipboard-w: 420px;
+  --orb-clipboard-h: 560px;
+  --orb-selection-w: 1px;
+  --orb-selection-h: 1px;
+  --orb-panel-inset: 0px;
+
   font-family: 'Segoe UI', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
   color: var(--star-bright);
   background: transparent;
@@ -168,14 +183,14 @@ button:focus-visible { outline: 3px solid var(--accent-violet); outline-offset: 
 
 .app-shell {
   position: relative;
-  width: 104px;
-  height: 104px;
+  width: var(--orb-floating-w);
+  height: var(--orb-floating-h);
   overflow: visible;
   background: transparent;
 }
-.app-shell.left-docked, .app-shell.right-docked { width: 44px; height: 120px; }
-.app-shell.top-docked { width: 320px; height: 62px; }
-.app-shell.expanded { position: relative; width: 340px; height: 340px; overflow: visible; }
+.app-shell.left-docked, .app-shell.right-docked { width: var(--orb-side-w); height: var(--orb-side-h); }
+.app-shell.top-docked { width: var(--orb-notch-w); height: var(--orb-notch-h); }
+.app-shell.expanded { position: relative; width: var(--orb-expanded-w); height: var(--orb-expanded-h); overflow: visible; }
 
 .orb-button {
   position: absolute;
@@ -259,8 +274,8 @@ button:focus-visible { outline: 3px solid var(--accent-violet); outline-offset: 
 
 .notch-button {
   display: flex;
-  width: 320px;
-  height: 62px;
+  width: var(--orb-notch-w);
+  height: var(--orb-notch-h);
   padding: 0 18px;
   align-items: center;
   gap: 12px;
@@ -626,7 +641,7 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
 /* 设置页：在展开窗口内替换圆盘 */
 .settings-panel {
   position: absolute;
-  inset: 6px;
+  inset: var(--orb-panel-inset);
   z-index: 8;
   display: flex;
   flex-direction: column;
@@ -774,6 +789,88 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
 .add-tray button:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--seg-stroke);
+}
+
+/* ============ 系统监控面板 ============ */
+.monitor-panel .settings-body { gap: 12px; }
+.monitor-loading {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.monitor-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.monitor-metric-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.monitor-metric-head strong {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+}
+.monitor-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--seg-fill);
+  overflow: hidden;
+}
+.monitor-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-cyan), var(--accent-violet));
+  transition: width .4s ease;
+}
+.monitor-cores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8px, 1fr));
+  gap: 3px;
+  height: 34px;
+  align-items: end;
+}
+.monitor-core {
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--seg-fill);
+  overflow: hidden;
+}
+.monitor-core i {
+  display: block;
+  width: 100%;
+  background: var(--accent-cyan);
+  opacity: .8;
+  transition: height .4s ease;
+}
+.monitor-sub {
+  font-size: 10px;
+  color: var(--text-label);
+  font-variant-numeric: tabular-nums;
+}
+.monitor-value {
+  font-size: 12px;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+}
+.monitor-temp {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+}
+.monitor-hint {
+  margin-right: auto;
+  font-size: 10px;
+  color: var(--text-label);
 }
 
 /* 圆盘编辑模式：拖动排序、拖出移除，圆盘本身就是编辑界面 */

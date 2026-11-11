@@ -11,6 +11,7 @@
 //! 搜索用 LIKE 而非 FTS5；不采集富文本，也不记录来源应用。
 //! 图片以 PNG 落盘、数据库只存路径，预览时按需生成缩略图，避免历史库膨胀。
 
+use crate::bus;
 use base64::Engine;
 use clipboard_rs::{
     Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
@@ -19,13 +20,12 @@ use clipboard_rs::{
 use clipboard_rs::common::RustImage;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager};
 
 /// 前端监听此事件做增量刷新 / 计数更新。
 pub const CLIP_CHANGED: &str = "clip://changed";
@@ -81,22 +81,8 @@ pub fn contains_secret(text: &str) -> bool {
 
 // ============ 数据结构与存储 ============
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClipItem {
-    pub id: i64,
-    /// text | files | image
-    pub kind: String,
-    /// 文本内容 / 文件列表 JSON 数组 / 图片 PNG 文件的绝对路径
-    pub content: String,
-    pub preview: String,
-    pub hash: String,
-    pub pinned: bool,
-    pub favorite: bool,
-    pub use_count: i64,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
+/// 历史条目结构由 orbit-core 契约统一定义，前端绑定与总线返回共用一份。
+pub use orbit_core::ClipItem;
 
 #[derive(Clone)]
 pub struct ClipboardState {
@@ -217,7 +203,7 @@ impl ClipboardState {
         guard.push((hash.to_string(), now + 5_000));
     }
 
-    /// 供旧的 `clip_write` 命令登记：写回纯文本后不应再被采集。
+    /// 写回纯文本后不应再被采集（`clipboard.write` 与写回共用）。
     pub fn suppress_text_write(&self, text: &str) {
         self.suppress(&hash_of(&format!("text:{text}")));
     }
@@ -538,12 +524,19 @@ impl ClipboardHandler for WatcherHandler {
             }
         };
         let count = self.state.count();
-        let _ = self.app.emit(
+        if let Err(error) = bus::emit(
+            &self.app,
             CLIP_CHANGED,
-            serde_json::json!({
-                "id": id, "kind": payload.kind, "deduplicated": deduplicated, "count": count
-            }),
-        );
+            &orbit_core::ClipboardChanged {
+                id,
+                kind: payload.kind.clone(),
+                deduplicated,
+                count,
+            },
+        ) {
+            // 事件不写审计，失败只进日志，不影响历史入库。
+            log::warn!("剪贴板变化事件发送失败：{error}");
+        }
     }
 }
 
@@ -551,7 +544,7 @@ impl ClipboardHandler for WatcherHandler {
 ///
 /// Tauri 2 的 `setup()` 会先按 config 创建所有窗口，再执行用户 setup 回调；
 /// 而窗口创建时前端 `onMount` 的 IPC 已经进入 WebView2 回调链。若到这里才
-/// `app.manage()`，启动期的 `get_dash_info` / `clip_list` 会命中
+/// `app.manage()`，启动期的 `system.dash` / `clipboard.list` 会命中
 /// `state() called before manage()` 并在 FFI 回调里 panic（0xc0000409）。
 pub fn init_state(app: &AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
@@ -596,11 +589,26 @@ pub fn start_watcher(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// ============ 命令 ============
+// ============ 命令实现（由命令总线调用） ============
 
-#[tauri::command]
-pub fn clip_list(
-    state: State<'_, ClipboardState>,
+/// 读取系统剪贴板文本。
+pub fn read_text() -> Result<String, String> {
+    let mut board = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    board.get_text().map_err(|error| error.to_string())
+}
+
+/// 写入纯文本；先登记写回抑制，避免自己写的内容再被采集。
+pub fn write_text(state: &ClipboardState, text: &str) -> Result<(), String> {
+    state.suppress_text_write(text);
+    let mut board = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    board
+        .set_text(text.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list(
+    state: &ClipboardState,
     query: Option<String>,
     filter: Option<String>,
     limit: Option<usize>,
@@ -615,13 +623,11 @@ pub fn clip_list(
     )
 }
 
-#[tauri::command]
-pub fn clip_count(state: State<'_, ClipboardState>) -> usize {
+pub fn count(state: &ClipboardState) -> usize {
     state.count()
 }
 
-#[tauri::command]
-pub fn clip_write_back(state: State<'_, ClipboardState>, id: i64) -> Result<(), String> {
+pub fn write_back(state: &ClipboardState, id: i64) -> Result<(), String> {
     let item = state.get(id)?.ok_or_else(|| "该条目已被删除".to_string())?;
     state.suppress(&item.hash);
     let context = ClipboardContext::new().map_err(|error| error.to_string())?;
@@ -646,8 +652,7 @@ pub fn clip_write_back(state: State<'_, ClipboardState>, id: i64) -> Result<(), 
 }
 
 /// 按需生成图片缩略图，返回可直接用于 `<img src>` 的 data URL。
-#[tauri::command]
-pub fn clip_image_preview(state: State<'_, ClipboardState>, id: i64) -> Result<String, String> {
+pub fn image_preview(state: &ClipboardState, id: i64) -> Result<String, String> {
     let item = state.get(id)?.ok_or_else(|| "该条目已被删除".to_string())?;
     if item.kind != "image" {
         return Err("该条目不是图片".to_string());
@@ -663,35 +668,41 @@ pub fn clip_image_preview(state: State<'_, ClipboardState>, id: i64) -> Result<S
     Ok(format!("data:image/png;base64,{encoded}"))
 }
 
-#[tauri::command]
-pub fn clip_set_pin(state: State<'_, ClipboardState>, id: i64, value: bool) -> Result<(), String> {
+pub fn set_pin(state: &ClipboardState, id: i64, value: bool) -> Result<(), String> {
     state.set_flag(id, "pinned", value)
 }
 
-#[tauri::command]
-pub fn clip_set_favorite(state: State<'_, ClipboardState>, id: i64, value: bool) -> Result<(), String> {
+pub fn set_favorite(state: &ClipboardState, id: i64, value: bool) -> Result<(), String> {
     state.set_flag(id, "favorite", value)
 }
 
-#[tauri::command]
-pub fn clip_delete(state: State<'_, ClipboardState>, id: i64) -> Result<(), String> {
+pub fn delete(state: &ClipboardState, id: i64) -> Result<(), String> {
     state.delete(id)
 }
 
-#[tauri::command]
-pub fn clip_clear(state: State<'_, ClipboardState>) -> Result<(), String> {
+pub fn clear(state: &ClipboardState) -> Result<(), String> {
     state.clear()
 }
 
-#[tauri::command]
-pub fn clip_set_monitor(state: State<'_, ClipboardState>, enabled: bool) -> bool {
+pub fn set_monitor(state: &ClipboardState, enabled: bool) -> bool {
     state.set_paused(!enabled);
     enabled
 }
 
-#[tauri::command]
-pub fn clip_get_monitor(state: State<'_, ClipboardState>) -> bool {
+pub fn get_monitor(state: &ClipboardState) -> bool {
     !state.is_paused()
+}
+
+pub fn open_window(app: &AppHandle) -> Result<(), String> {
+    show_clipboard_window(app)
+}
+
+pub fn close_window(app: &AppHandle) -> Result<(), String> {
+    hide_clipboard_window(app)
+}
+
+pub fn shortcut() -> String {
+    CLIP_SHORTCUT.to_string()
 }
 
 fn show_clipboard_window(app: &AppHandle) -> Result<(), String> {
@@ -701,7 +712,9 @@ fn show_clipboard_window(app: &AppHandle) -> Result<(), String> {
     app.state::<ClipboardState>().mark_shown();
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
-    let _ = app.emit(CLIP_WINDOW_SHOWN, ());
+    if let Err(error) = bus::emit(app, CLIP_WINDOW_SHOWN, &()) {
+        log::warn!("剪贴板窗口显示事件发送失败：{error}");
+    }
     Ok(())
 }
 
@@ -726,21 +739,6 @@ pub fn toggle_clipboard_window(app: &AppHandle) {
     if let Err(error) = result {
         log::warn!("切换剪贴板窗口失败：{error}");
     }
-}
-
-#[tauri::command]
-pub fn clip_open_window(app: AppHandle) -> Result<(), String> {
-    show_clipboard_window(&app)
-}
-
-#[tauri::command]
-pub fn clip_close_window(app: AppHandle) -> Result<(), String> {
-    hide_clipboard_window(&app)
-}
-
-#[tauri::command]
-pub fn clip_shortcut() -> String {
-    CLIP_SHORTCUT.to_string()
 }
 
 #[cfg(test)]
@@ -812,5 +810,74 @@ mod tests {
         state.remove_image_file(&outside.to_string_lossy());
         assert!(outside.exists());
         let _ = std::fs::remove_file(&outside);
+    }
+
+    /// 冒烟 1：真实写系统剪贴板并读回，结束后恢复原内容。
+    #[test]
+    fn write_then_read_roundtrip_restores_clipboard() {
+        let original = read_text().ok();
+        let state = test_state();
+        let marker = format!("orbit-smoke-{}", now_ms());
+        write_text(&state, &marker).expect("写入剪贴板失败");
+        // Windows 剪贴板写入后其他监听者会短暂持有，读取需要小步重试。
+        let mut last_error = None;
+        let mut matched = false;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(30));
+            match read_text() {
+                Ok(text) if text == marker => {
+                    matched = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        assert!(matched, "读回的剪贴板内容与写入不一致：{last_error:?}");
+        match original {
+            Some(text) => write_text(&state, &text).expect("恢复剪贴板失败"),
+            None => {
+                let mut board = arboard::Clipboard::new().expect("打开剪贴板失败");
+                let _ = board.clear();
+            }
+        }
+    }
+
+    /// 冒烟 2：收藏开关落库并持久化。
+    #[test]
+    fn favorite_flag_persists() {
+        let state = test_state();
+        let hash = hash_of("text:favorite-smoke");
+        let (id, _) = state
+            .upsert("text", "favorite-smoke", "favorite-smoke", &hash)
+            .unwrap();
+        set_favorite(&state, id, true).unwrap();
+        assert!(state.get(id).unwrap().unwrap().favorite);
+        set_favorite(&state, id, false).unwrap();
+        assert!(!state.get(id).unwrap().unwrap().favorite);
+    }
+
+    /// 冒烟 3：图片预览走「文件路径 → 缩略图 → base64 data URL」，
+    /// 确认二进制不直接跨 IPC 传输。
+    #[test]
+    fn image_preview_returns_base64_data_url() {
+        let state = test_state();
+        // 1x1 透明 PNG
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+            .unwrap();
+        let path = state.store_image("smoke-preview", &png).unwrap();
+        let hash = hash_of("image:smoke-preview");
+        let (id, _) = state
+            .upsert(
+                "image",
+                &path.to_string_lossy(),
+                "图片",
+                &hash,
+            )
+            .unwrap();
+        let preview = image_preview(&state, id).unwrap();
+        assert!(preview.starts_with("data:image/png;base64,"));
+        assert!(preview.len() > "data:image/png;base64,".len());
     }
 }

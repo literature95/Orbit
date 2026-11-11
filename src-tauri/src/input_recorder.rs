@@ -2,19 +2,8 @@
 //! 不用 rdev::listen——它阻塞且无停止 API，每次录制会泄漏一个线程；
 //! 原生钩子可通过 PostThreadMessage(WM_QUIT) + UnhookWindowsHookEx 干净停止。
 
-use serde::Serialize;
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct KbEvent {
-    pub timestamp: u64,
-    pub kind: String,
-    pub key: Option<String>,
-    pub x: Option<i32>,
-    pub y: Option<i32>,
-    pub button: Option<String>,
-    pub direction: Option<String>,
-}
+/// 事件结构由 orbit-core 契约统一定义，总线返回与前端绑定共用一份。
+pub use orbit_core::KbEvent;
 
 pub fn save_recording(
     dir: &std::path::Path,

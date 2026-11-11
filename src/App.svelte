@@ -1,12 +1,15 @@
 ﻿<script lang="ts">
-  import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { isTauri } from '@tauri-apps/api/core';
   import { emit, listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
-  import type { CommandRequest } from '../crates/orbit-core/bindings/CommandRequest';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import type { WindowLayout } from '../crates/orbit-core/bindings/WindowLayout';
+  import type { WindowSize } from '../crates/orbit-core/bindings/WindowSize';
+  import { runCommand } from './bus';
   import ClipboardPanel from './ClipboardPanel.svelte';
   import DiscSettings from './DiscSettings.svelte';
+  import SystemMonitor from './SystemMonitor.svelte';
   import OrbGalaxy from './OrbGalaxy.svelte';
 
   type DockPosition = 'floating' | 'left' | 'right' | 'top';
@@ -19,15 +22,6 @@
     cpuUsage: number;
     cpuTemperature: number | null;
     gameFps: number | null;
-  };
-  type SystemInfo = {
-    osName: string;
-    osVersion: string;
-    screenWidth: number;
-    screenHeight: number;
-    scaleFactor: number;
-    totalMemoryMb: number;
-    availableMemoryMb: number;
   };
   type RegionSelectionStart = { monitorId: number };
   type RegionBounds = { left: number; top: number; width: number; height: number };
@@ -74,7 +68,8 @@
   }
 
   // ============ 圆盘几何 ============
-  // 展开窗口与 SVG viewBox 同为 340×340，画布 1 单位 = 1px
+  // 展开窗口尺寸由 overlay.layout 下发；viewBox 固定 340×340 作为几何基准坐标系，
+  // SVG 容器随窗口 100% 缩放，配置尺寸变化时圆盘自动等比映射，无需改写半径常量。
   // 悬浮球半径 = 41px（orb-button 宽 82px 的一半）
   // 内圆 / 外圆半径可在编辑页拖动，范围受窗口与最小扇区宽度约束
   const VIEW = 340;
@@ -256,19 +251,18 @@
   }
 
   // ============ 系统监控 ============
-  let monitorInfo: SystemInfo | null = null;
   let recordingActive = false;
   async function toggleRecord() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用录屏。'; return; }
     if (!recordingActive) {
       try {
-        const path = await invoke<string>('record_start');
+        const path = await runCommand<string>('record.start');
         recordingActive = true;
         notice = `⏺ 录屏中… 保存到：${path}`;
       } catch (e) { notice = `录屏启动失败：${String(e)}`; }
     } else {
       try {
-        const path = await invoke<string | null>('record_stop');
+        const path = await runCommand<string | null>('record.stop');
         recordingActive = false;
         notice = path ? `✅ 录屏已保存：${path}` : '✅ 录屏已停止';
       } catch (e) { notice = `录屏停止失败：${String(e)}`; }
@@ -279,8 +273,8 @@
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用 OCR。'; return; }
     notice = '🔍 正在截屏+识别…';
     try {
-      const text = await invoke<string>('ocr_current_screen');
-      await invoke('clip_write', { text });
+      const text = await runCommand<string>('ocr.current_screen');
+      await runCommand('clipboard.write', { text });
       notice = `✅ OCR 完成（${text.length}字），已写回剪贴板：${text.slice(0, 30)}…`;
     } catch (e) { notice = `OCR 失败：${String(e)}`; }
   }
@@ -289,10 +283,10 @@
   async function toggleKbRecord() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
     if (!kbRecording) {
-      try { await invoke('kb_record_start'); kbRecording = true; notice = '🎮 键鼠录制中…再次点击扇区停止并保存'; }
+      try { await runCommand('kb_record.start'); kbRecording = true; notice = '🎮 键鼠录制中…再次点击扇区停止并保存'; }
       catch (e) { notice = `录制启动失败：${String(e)}`; }
     } else {
-      try { await invoke('kb_record_stop'); kbRecording = false; notice = '🎮 录制已停止并保存到本地'; }
+      try { await runCommand('kb_record.stop'); kbRecording = false; notice = '🎮 录制已停止并保存到本地'; }
       catch (e) { notice = `停止失败：${String(e)}`; }
     }
   }
@@ -320,7 +314,7 @@
       if (!outPath) return;
       convertBusy = true;
       notice = `🔄 正在转换为 ${format.toUpperCase()}…`;
-      const result = await invoke<string>('convert_format', {
+      const result = await runCommand<string>('convert.format', {
         inputPath: input,
         outputPath: outPath,
         format,
@@ -344,13 +338,13 @@
   }
   async function showSystemMonitor() {
     if (!desktopBridgeAvailable) { notice = '请在 Orbit 桌面端使用系统监控。'; return; }
-    try {
-      monitorInfo = await invoke<SystemInfo>('get_system_info');
-      notice = `${monitorInfo.screenWidth}×${monitorInfo.screenHeight} · ${monitorInfo.totalMemoryMb}MB RAM`;
-    } catch (error) {
-      notice = `系统信息获取失败：${String(error)}`;
-    }
+    await setPanelOpen(true);
+    monitorOpen = true;
+    settingsOpen = false;
+    convertInput = null;
+    trayOpen = false;
   }
+  let monitorOpen = false;
   // ============ 剪贴板：采集/存储已下沉到 Rust + SQLite，前端只负责唤起面板 ============
   let dashPollTimer: ReturnType<typeof setInterval> | null = null;
   let clockTimer: ReturnType<typeof setInterval> | null = null;
@@ -358,18 +352,34 @@
   async function pollDashInfo() {
     if (!desktopBridgeAvailable) return;
     try {
-      dashInfo = await invoke<DashInfo>('get_dash_info');
+      dashInfo = await runCommand<DashInfo>('system.dash');
     } catch { /* 保留上一次真实采样，不用占位值覆盖 */ }
   }
 
   async function showClipHistory(): Promise<void> {
     if (!desktopBridgeAvailable) { notice = '请在 Orbit 桌面端使用剪贴板历史。'; return; }
     try {
-      await invoke('clip_open_window');
+      await runCommand('clipboard.open_window');
       await setPanelOpen(false);
     } catch (error) {
       notice = `打开剪贴板失败：${String(error)}`;
     }
+  }
+
+  // 窗口尺寸的唯一前端入口：把配置注入 :root，供所有弹窗与圆盘使用
+  function applyWindowLayout(layout: WindowLayout): void {
+    const style = document.documentElement.style;
+    const setSize = (name: string, size: WindowSize): void => {
+      style.setProperty(`--orb-${name}-w`, `${size.width}px`);
+      style.setProperty(`--orb-${name}-h`, `${size.height}px`);
+    };
+    setSize('floating', layout.floating);
+    setSize('side', layout.side);
+    setSize('notch', layout.notch);
+    setSize('expanded', layout.expanded);
+    setSize('clipboard', layout.clipboard);
+    setSize('selection', layout.selection);
+    style.setProperty('--orb-panel-inset', `${layout.panelInset}px`);
   }
 
   // 初始化：从 localStorage 读主题
@@ -378,6 +388,15 @@
       const saved = localStorage.getItem('orbit.theme') as (typeof THEMES)[number] | null;
       if (saved && THEMES.includes(saved)) applyTheme(saved);
     } catch { /* ignore */ }
+
+    // 三个窗口（悬浮球 / 剪贴板 / 选区）都读取同一份尺寸配置
+    if (desktopBridgeAvailable) {
+      void runCommand<WindowLayout>('overlay.layout')
+        .then(applyWindowLayout)
+        .catch((error: unknown) => {
+          console.warn('窗口尺寸配置读取失败，使用 CSS 兜底值', error);
+        });
+    }
 
     // 剪贴板窗口由 ClipboardPanel 自行接管，不注册悬浮层事件与仪表盘轮询
     if (isClipboardWindow) return;
@@ -403,7 +422,7 @@
           else unlisten = dispose;
         })
         .catch((error: unknown) => {
-          void invoke('cancel_region_selection').then(
+          void runCommand('region.cancel').then(
             () => emit('region-capture-result', { error: `区域截图界面初始化失败：${String(error)}` }),
             (cancelError: unknown) =>
               emit('region-capture-result', {
@@ -441,7 +460,7 @@
       getCurrentWindow().onMoved(() => {
         if (moveTimer) clearTimeout(moveTimer);
         moveTimer = setTimeout(() => {
-          void invoke<OverlaySnapshot>('dock_overlay')
+          void runCommand<OverlaySnapshot>('overlay.dock')
             .then((layout) => {
               dockPosition = layout.dock;
               panelOpen = layout.expanded;
@@ -458,7 +477,7 @@
           return;
         }
         unlisteners = disposeListeners;
-        void invoke<SetupResult>('get_setup_status')
+        void runCommand<SetupResult>('app.setup.status')
           .then((result) => {
             autostartConfigured = result.autostartConfigured;
             setupAttempted = result.autostartConfigured;
@@ -467,7 +486,7 @@
           .catch((error: unknown) => {
             notice = `读取设置状态失败：${String(error)}`;
           });
-        void invoke<OverlaySnapshot>('dock_overlay')
+        void runCommand<OverlaySnapshot>('overlay.dock')
           .then((layout) => {
             dockPosition = layout.dock;
             panelOpen = layout.expanded;
@@ -489,13 +508,14 @@
 
   async function setPanelOpen(open: boolean): Promise<void> {
     if (desktopBridgeAvailable) {
-      await invoke('set_overlay_open', { open });
+      await runCommand('overlay.set_open', { open });
     }
     panelOpen = open;
     notice = '';
     if (!open) {
       convertInput = null;
       settingsOpen = false;
+      monitorOpen = false;
       editMode = false;
       trayOpen = false;
       editDrag = null;
@@ -509,6 +529,7 @@
     try {
       await setPanelOpen(true);
       settingsOpen = true;
+      monitorOpen = false;
     } catch (error) {
       notice = `打开设置失败：${String(error)}`;
     }
@@ -676,7 +697,7 @@
       return;
     }
     try {
-      await invoke('quit_app');
+      await runCommand('app.quit');
     } catch (error) {
       notice = `退出失败：${String(error)}`;
     }
@@ -694,7 +715,7 @@
         return;
       }
 
-      const result = await invoke<SetupResult>('complete_first_run_setup');
+      const result = await runCommand<SetupResult>('app.setup.complete');
       autostartConfigured = result.autostartConfigured;
       permissionStates = result.permissions;
       setupAttempted = result.autostartConfigured;
@@ -716,7 +737,7 @@
     setupRunning = true;
     notice = '';
     try {
-      const result = await invoke<SetupResult>('set_autostart_enabled', {
+      const result = await runCommand<SetupResult>('app.autostart.set', {
         enabled: !autostartConfigured,
       });
       autostartConfigured = result.autostartConfigured;
@@ -739,15 +760,8 @@
 
     captureRunning = true;
     notice = '';
-    const request: CommandRequest = {
-      commandId: 'screenshot.capture',
-      params: { mode: 'fullscreen' },
-    };
     try {
-      const response = await invoke<CommandResponse>('execute_command', { request });
-      if (response.status !== 'ok') {
-        throw new Error(response.error ?? '截图命令执行失败。');
-      }
+      await runCommand('screenshot.capture', { mode: 'fullscreen' });
       notice = '全屏截图已复制到剪贴板。';
     } catch (error) {
       notice = `截图失败：${String(error)}`;
@@ -766,7 +780,7 @@
     captureRunning = true;
     notice = '';
     try {
-      await invoke('start_region_selection');
+      await runCommand('region.start');
     } catch (error) {
       captureRunning = false;
       notice = `无法开始区域截图：${String(error)}`;
@@ -821,11 +835,11 @@
     selectionStart = null;
     selectionBounds = null;
     try {
-      const response = await invoke<CommandResponse>('finish_region_selection', request);
+      const response = await runCommand<CommandResponse>('region.finish', request);
       await emit('region-capture-result', { response });
     } catch (error) {
       try {
-        await invoke('cancel_region_selection');
+        await runCommand('region.cancel');
       } catch (restoreError) {
         await emit('region-capture-result', {
           error: `${String(error)}；恢复 Orbit 主窗口失败：${String(restoreError)}`,
@@ -842,7 +856,7 @@
     selectionStart = null;
     selectionBounds = null;
     try {
-      await invoke('cancel_region_selection');
+      await runCommand('region.cancel');
       await emit('region-capture-result', { cancelled: true });
     } catch (error) {
       await emit('region-capture-result', { error: `取消区域截图失败：${String(error)}` });
@@ -1185,6 +1199,9 @@
           onclick={cancelConvert}
         >取消</button>
       </div>
+    {/if}
+    {#if monitorOpen}
+      <SystemMonitor onclose={() => { monitorOpen = false; }} />
     {/if}
     {/if}
   {:else if dockPosition === 'top'}
