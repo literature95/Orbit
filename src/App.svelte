@@ -4,6 +4,14 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import type { DashInfo } from '../crates/orbit-core/bindings/DashInfo';
+  import type { DockPosition } from '../crates/orbit-core/bindings/DockPosition';
+  import type { OcrResult } from '../crates/orbit-core/bindings/OcrResult';
+  import type { OverlaySnapshot } from '../crates/orbit-core/bindings/OverlaySnapshot';
+  import type { RecordStateEvent } from '../crates/orbit-core/bindings/RecordStateEvent';
+  import type { RecoveryItem } from '../crates/orbit-core/bindings/RecoveryItem';
+  import type { RegionSelectionStart } from '../crates/orbit-core/bindings/RegionSelectionStart';
+  import type { SetupResult } from '../crates/orbit-core/bindings/SetupResult';
   import type { WindowLayout } from '../crates/orbit-core/bindings/WindowLayout';
   import type { WindowSize } from '../crates/orbit-core/bindings/WindowSize';
   import { runCommand } from './bus';
@@ -12,24 +20,12 @@
   import SystemMonitor from './SystemMonitor.svelte';
   import OrbGalaxy from './OrbGalaxy.svelte';
 
-  type DockPosition = 'floating' | 'left' | 'right' | 'top';
-  type OverlaySnapshot = { dock: DockPosition; expanded: boolean };
-  type SetupResult = {
-    autostartConfigured: boolean;
-    permissions: Record<string, 'unknown'>;
-  };
-  type SystemMetrics = {
-    cpuUsage: number;
-    cpuTemperature: number | null;
-    gameFps: number | null;
-  };
-  type RegionSelectionStart = { monitorId: number };
+  // 选区矩形是前端本地交互状态；其余类型全部来自 ts-rs 生成的契约绑定。
   type RegionBounds = { left: number; top: number; width: number; height: number };
 
   const desktopBridgeAvailable = isTauri();
   // 同一份前端按窗口标签分流：clipboard 窗口只渲染剪贴板面板
   const isClipboardWindow = desktopBridgeAvailable && getCurrentWindow().label === 'clipboard';
-  const emptyMetrics: SystemMetrics = { cpuUsage: 0, cpuTemperature: null, gameFps: null };
   let dockPosition: DockPosition = 'floating';
   let panelOpen = false;
   let setupRunning = false;
@@ -37,7 +33,6 @@
   let autostartConfigured = false;
   let setupAttempted = false;
   let permissionStates: SetupResult['permissions'] = {};
-  let metrics = emptyMetrics;
   let notice = '';
   let dragStart: { pointerId: number; x: number; y: number } | null = null;
   let suppressClick = false;
@@ -206,16 +201,6 @@
   }
 
   // ============ 灵动岛仪表盘 ============
-  type DashInfo = {
-    cpuPercent: number;
-    memoryUsedPercent: number;
-    memoryUsedMb: number;
-    memoryTotalMb: number;
-    uptimeSecs: number;
-    timeNow: string;
-    clipboardCount: number;
-    temperatureC: number | null;
-  };
   let dashInfo: DashInfo | null = null;
 
   function formatClock() {
@@ -251,20 +236,47 @@
   }
 
   // ============ 系统监控 ============
+  // 录制期间悬浮球被隐藏，Alt+V 由 Rust 侧直接停止；状态只能靠事件回流保持一致。
+  function handleRecordState(state: RecordStateEvent): void {
+    switch (state.phase) {
+      case 'started':
+        recordingActive = true;
+        notice = `⏺ 录屏中（悬浮球已隐藏），按 Alt+V 停止；保存到：${state.path ?? ''}`;
+        break;
+      case 'saving':
+        notice = '⏺ 正在结束录屏并保存…';
+        break;
+      case 'saved':
+        recordingActive = false;
+        notice = state.path ? `✅ 录屏已保存：${state.path}` : '✅ 录屏已停止';
+        break;
+      case 'recovering':
+        recordingActive = false;
+        void runCommand<RecoveryItem[]>('record.recovery.list')
+          .then((items) => {
+            notice = `⚠️ ${state.message ?? '录屏收尾异常'}；恢复区现有 ${items.length} 个文件${state.path ? `：${state.path}` : ''}`;
+          })
+          .catch(() => {
+            notice = `⚠️ ${state.message ?? '录屏收尾异常'}${state.path ? `：${state.path}` : ''}`;
+          });
+        break;
+      default:
+        break;
+    }
+  }
+
   let recordingActive = false;
   async function toggleRecord() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用录屏。'; return; }
     if (!recordingActive) {
       try {
-        const path = await runCommand<string>('record.start');
+        await runCommand<string>('record.start');
         recordingActive = true;
-        notice = `⏺ 录屏中… 保存到：${path}`;
       } catch (e) { notice = `录屏启动失败：${String(e)}`; }
     } else {
       try {
-        const path = await runCommand<string | null>('record.stop');
+        await runCommand<string | null>('record.stop');
         recordingActive = false;
-        notice = path ? `✅ 录屏已保存：${path}` : '✅ 录屏已停止';
       } catch (e) { notice = `录屏停止失败：${String(e)}`; }
     }
   }
@@ -273,9 +285,10 @@
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用 OCR。'; return; }
     notice = '🔍 正在截屏+识别…';
     try {
-      const text = await runCommand<string>('ocr.current_screen');
-      await runCommand('clipboard.write', { text });
-      notice = `✅ OCR 完成（${text.length}字），已写回剪贴板：${text.slice(0, 30)}…`;
+      const result = await runCommand<OcrResult>('ocr.current_screen');
+      await runCommand('clipboard.write', { text: result.text });
+      const words = result.lines.reduce((total, line) => total + line.words.length, 0);
+      notice = `✅ OCR 完成（${result.text.length}字 / ${result.lines.length}行 / ${words}词，带坐标），已写回剪贴板：${result.text.slice(0, 30)}…`;
     } catch (e) { notice = `OCR 失败：${String(e)}`; }
   }
 
@@ -454,8 +467,8 @@
               : `区域截图失败：${payload.response?.error ?? '截图命令执行失败。'}`;
         },
       ),
-      listen<SystemMetrics>('system-metrics', ({ payload }) => {
-        metrics = payload;
+      listen<RecordStateEvent>('record-state', ({ payload }) => {
+        handleRecordState(payload);
       }),
       getCurrentWindow().onMoved(() => {
         if (moveTimer) clearTimeout(moveTimer);
@@ -967,10 +980,6 @@
     } catch (error) {
       notice = `收起覆盖层失败：${String(error)}`;
     }
-  }
-
-  function formatCpuTemperature(value: number | null): string {
-    return value === null ? '--' : `${Math.round(value)}°`;
   }
 
   // 剪贴板窗口不参与悬浮球交互，避免全局拖拽 / 右键菜单干扰面板

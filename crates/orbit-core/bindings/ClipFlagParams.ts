@@ -3,4 +3,4 @@
 /**
  * 置顶 / 收藏开关。
  */
-export type ClipFlagParams = { id: bigint, value: boolean, };
+export type ClipFlagParams = { id: number, value: boolean, };

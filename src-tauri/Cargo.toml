@@ -31,7 +31,7 @@ tauri-plugin-autostart = "2.7.0"
 tauri-plugin-window-state = "2.5.0"
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
-sysinfo = { version = "0.37.2", default-features = false, features = ["component", "system", "disk"] }
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 orbit-core = { version = "0.1.0", path = "../crates/orbit-core" }
 xcap = "0.9.8"
 arboard = "3.7.0"
@@ -44,6 +44,9 @@ base64 = "0.21"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
+
+# enigo 只用于 input_recorder 的合成按键测试，不进入生产二进制。
+[target.'cfg(target_os = "windows")'.dev-dependencies]
 enigo = "0.2"
 
-# helper 二进制用（和主进程共享 sysinfo/serde），但 serde_json 主进程也需要所以全局有
+# helper 二进制与主进程共享 serde / serde_json；sysinfo 仅保留 system feature。

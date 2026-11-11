@@ -1,21 +1,10 @@
 <script lang="ts">
   import { listen } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
+  import type { ClipItem } from '../crates/orbit-core/bindings/ClipItem';
+  import type { ClipboardChanged } from '../crates/orbit-core/bindings/ClipboardChanged';
   import { runCommand } from './bus';
 
-  type ClipItem = {
-    id: number;
-    kind: string;
-    content: string;
-    preview: string;
-    hash: string;
-    pinned: boolean;
-    favorite: boolean;
-    useCount: number;
-    createdAt: number;
-    updatedAt: number;
-  };
-  type ClipChanged = { id: number; kind: string; deduplicated: boolean; count: number };
   type Filter = 'all' | 'favorite' | 'pinned' | 'text' | 'files' | 'image';
 
   const FILTERS: { id: Filter; label: string }[] = [
@@ -33,7 +22,8 @@
   let monitoring = true;
   let status = '';
   let clearArmed = false;
-  let shortcutLabel = 'Alt+V';
+  // 首帧占位；真实快捷键由 clipboard.shortcut 命令在 onMount 时下发。
+  let shortcutLabel = '快捷键';
   let previewItem: ClipItem | null = null;
   let previewUrl = '';
   let searchInput: HTMLInputElement | null = null;
@@ -194,7 +184,7 @@
         .then((dispose) => { if (disposed) dispose(); else disposers.push(dispose); })
         .catch(() => { /* 忽略 */ });
     };
-    attach(listen<ClipChanged>('clip://changed', () => { void refresh(); }));
+    attach(listen<ClipboardChanged>('clip://changed', () => { void refresh(); }));
     // 全局快捷键 / 圆盘唤起窗口时，重置预览并聚焦搜索框
     attach(listen('clip://shown', () => {
       closePreview();

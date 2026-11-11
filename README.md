@@ -3,7 +3,7 @@
 
 > 项目代号：Orbit · 中文名：轨道 · 技术栈：Tauri 2 + Rust 原生管线 · 定位：速度优先、可编程、可换肤的常驻自动化中枢
 >
-> 进度更新：2026-11-11。当前已可在 Windows 实机安装运行（银河悬浮球 + 可自定义扇区圆盘 + 灵动岛仪表盘）；2026-11-11 新增 `overlay.layout` 命令，所有窗口与弹窗尺寸统一由配置下发。文中的性能数字仍是待验证的初始目标，不代表已达标。
+> 进度更新：2026-11-11。当前已可在 Windows 实机安装运行（银河悬浮球 + 可自定义扇区圆盘 + 灵动岛仪表盘）；2026-11-11 新增 `overlay.layout` 命令，所有窗口与弹窗尺寸统一由配置下发；OCR 结果改为结构化返回（文本 + 行/词 + bbox）；同日参考 Kiri 完成录屏小修（区域录制、录制期隐藏悬浮球 + `Alt+V` 停止、状态事件、失败恢复区、ffprobe 冒烟）；同日完成一次文档与代码一致性整理：移除无消费者的 `system-metrics` 采样链路、前端统一改用 ts-rs 生成绑定、release 保留告警日志、收敛测试专用依赖与 helper 死分支。文中的性能数字仍是待验证的初始目标，不代表已达标。
 
 ## 开发环境
 
@@ -11,7 +11,7 @@
 
 ```bash
 sudo apt update
-sudo apt install build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libwebkit2gtk-4.1-dev libpipewire-0.3-dev libgbm-dev libpipewire-0.3-dev
+sudo apt install build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libwebkit2gtk-4.1-dev libpipewire-0.3-dev libgbm-dev
 ```
 
 安装 Rust stable 后，在仓库根目录执行：
@@ -23,7 +23,7 @@ npm run tauri:dev
 
 `npm run check` 和 `npm run build` 用于前端检查与构建；`npm run tauri:build` 构建桌面安装包。首次 Rust 构建需要下载并编译依赖。macOS 和 Windows 的系统依赖请按 Tauri 2 对应平台的开发环境要求安装。
 
-> **构建方式约束（2026-11-10 实测）**：验证 release 产物必须用 `npm run tauri build`（或 `npm run tauri build -- --no-bundle` 只要 exe）。直接 `cargo build --release` 会产出**未内嵌前端资源**的 exe，启动后 WebView2 去连 `localhost:1420` 并显示“无法访问此页面”。判定方法：在 exe 中检索 `assets/index-` 字符串应为命中，`cargo` 裸构建命中数为 0。
+> **构建方式约束（2026-11-10 实测）**：验证 release 产物必须走 Tauri 打包脚本——本地只要 exe 用 `npm run tauri -- build --no-bundle`，CI 出 NSIS 安装包用 `npm run tauri:build -- --bundles nsis`。直接 `cargo build --release` 会产出**未内嵌前端资源**的 exe，启动后 WebView2 去连 `localhost:1420` 并显示“无法访问此页面”。判定方法：在 exe 中检索 `assets/index-` 字符串应为命中，`cargo` 裸构建命中数为 0。
 >
 > **实机冒烟方式**：从自动化终端用 `Start-Process` 启动的进程会在该条命令结束时被回收（表现为“启动后自行退出”，且没有 `Exit` 事件），这不是应用缺陷。手动验证请用 `explorer.exe <exe 路径>` 脱离启动，进程即可跨命令存活。
 
@@ -33,9 +33,9 @@ Orbit 启动后显示透明置顶悬浮球（默认 Orbit 白：白底、球心�
 
 顶部刘海状态条常驻显示当前时间、CPU 使用率与内存使用率；启用管理员增强后追加 CPU 温度，未启用或无数据时温度整格隐藏。时间为每秒刷新，其余每 2 秒拉取。所有数值均来自实时采样，首次采样就绪前只显示时钟，不渲染任何占位或估算数字。
 
-剪贴板历史也可通过全局快捷键 `Alt+V` 随时唤起或收起，窗口失焦后自动隐藏。历史存放于独立的 `clipboard.db`（SQLite WAL，保留 200 条），由操作系统剪贴板事件驱动采集，支持文本、文件列表与图片；图片以 PNG 落盘，面板内按需生成缩略图预览，并可原样写回剪贴板。高置信密钥/令牌（私钥块、GitHub/OpenAI/Slack token、AWS key、JWT、带字段名的 secret）命中即跳过入库，监听可在面板内暂停。
+剪贴板历史也可通过全局快捷键 `Alt+V` 随时唤起或收起，窗口失焦后自动隐藏；录屏进行中悬浮球会被隐藏，此时同一快捷键临时承担「停止录制」入口，录制结束后恢复剪贴板语义。历史存放于独立的 `clipboard.db`（SQLite WAL，保留 200 条），由操作系统剪贴板事件驱动采集，支持文本、文件列表与图片；图片以 PNG 落盘，面板内按需生成缩略图预览，并可原样写回剪贴板。高置信密钥/令牌（私钥块、GitHub/OpenAI/Slack token、AWS key、JWT、带字段名的 secret）命中即跳过入库，监听可在面板内暂停。
 
-置顶窗口只能请求操作系统窗口管理器提升层级，不能保证覆盖独占全屏游戏、受保护视频或系统安全界面。Windows/macOS 全屏空间、Linux Wayland 合成器及游戏/显卡驱动可能隐藏普通桌面覆盖层；需要实际平台验收。游戏 FPS 没有跨游戏通用读取接口，当前显示 `--`，不能将屏幕采样伪装成游戏帧率。接入帧率需后续按游戏/平台选择受支持的遥测接口。
+置顶窗口只能请求操作系统窗口管理器提升层级，不能保证覆盖独占全屏游戏、受保护视频或系统安全界面。Windows/macOS 全屏空间、Linux Wayland 合成器及游戏/显卡驱动可能隐藏普通桌面覆盖层；需要实际平台验收。游戏 FPS 没有跨游戏通用读取接口，UI 当前不显示 FPS 数值，不能将屏幕采样伪装成游戏帧率。接入帧率需后续按游戏/平台选择受支持的遥测接口。
 
 ## 当前项目进度（2026-11-11）
 
@@ -46,17 +46,17 @@ Orbit 启动后显示透明置顶悬浮球（默认 Orbit 白：白底、球心�
 | Tauri 桌面工程 | 已实现 | Svelte/Vite 前端与 Tauri 2/Rust 桌面端已接通；Node.js 用于前端及打包工具链，不是打包后应用的运行时依赖。 |
 | 悬浮球与圆盘 | 已实现 | 默认 Orbit 白（白底 + 黑色 Orbit 字标），深色主题为黑色球体内 Canvas 2D 银河旋涡（2700 粒子）；点击球体原位展开扇区圆盘（默认 12 扇区，扇区无图标仅居中大字），扇区布局与半径可编辑：在圆盘本体上拖动排序、拖到中心或拖出移除、拖动顶部圆点调整内圆/外圈、球心加回，1–12 扇区自动等分圆盘，保存即生效，布局与半径存 localStorage；透明置顶无边框窗口（展开 340×340）、展开状态拖球心移动、贴边 24px 吸附停靠、窗口位置保存均已接入。 |
 | 灵动岛仪表盘 | 已实现 | 刘海状态条纯文字显示时间、CPU、内存，温度可用时追加；时间为每秒刷新，其余每 2 秒拉取。CPU 复用同一 sysinfo 实例采样，避免首次刷新出现 0%/100% 假读数。 |
-| 系统状态 | 已实现 | CPU 使用率、内存、开机时长可采集（sysinfo）；温度依赖用户启用管理员增强：一次 UAC 拉起常驻 helper，每 5 秒写共享 JSON，主进程只读文件（不再每次刷新弹 UAC），无数据时显示 `--`。进程列表、游戏 FPS 未接入。 |
-| 一键设置与权限 | 已实现（管理员为按需） | 设置页可开关登录启动、调整轮盘布局（拖动排序、拖到中心删除、拖动顶部圆点调整内外圈半径）、退出 Orbit（右键悬浮球或「设置」扇区进入）。主进程保持普通权限，管理员能力由独立 elevated sidecar（requireAdministrator manifest）承担：启用时一次 UAC 授权进入常驻 watch 模式，关闭时删标志文件令其自行退出，主进程退出/崩溃时 helper 由父进程存活检查兜底清理。 |
+| 系统状态 | 已实现 | CPU 使用率、内存、开机时长可采集（sysinfo）；温度依赖用户启用管理员增强：一次 UAC 拉起常驻 helper，每 5 秒写共享 JSON，主进程只读文件（不再每次刷新弹 UAC），无数据时隐藏温度整格，不显示占位或估算值。进程列表、游戏 FPS 未接入。 |
+| 一键设置与权限 | 已实现（管理员为按需） | 设置页可开关登录启动、调整轮盘布局（拖动排序、拖到中心删除、拖动顶部圆点调整内外圈半径）、退出 Orbit（右键悬浮球或「设置」扇区进入）。主进程保持普通权限，管理员能力由独立 elevated sidecar 承担（主进程用 PowerShell `-Verb RunAs` 拉起；`helper-manifest/` 下的 requireAdministrator manifest 未被嵌入，见 `src-tauri/build.rs` 注释）：启用时一次 UAC 授权进入常驻 watch 模式，关闭时删标志文件令其自行退出，主进程退出/崩溃时 helper 由父进程存活检查兜底清理。 |
 | P0-2 拖拽/点击冲突 | 已实现 | 4px 拖动阈值、双击预判、拖动后抑制点击已接入；圆盘展开时球体不再响应拖动，避免误触。 |
-| P0-3 命令契约与命令总线 | 已实现 | 2026-11-09 完成总线注册表化改造：新增 `src-tauri/src/bus.rs`，`bus::execute` 查表路由（契约来自 orbit-core::command_catalog 单一事实源，强类型 params 反序列化 + deny_unknown_fields，同步处理器跑阻塞线程池），审计改为后台异步写入不阻塞响应，`get_command_catalog` 直接读注册表保证目录与可路由命令一致。2026-11-10 完成阶段 2：`system.monitor`、`overlay.dock`、`overlay.set_open`、`app.setup.status`、`app.setup.complete`、`app.autostart.set`、`app.quit` 入总线。2026-11-10 完成阶段 3：15 条 `clipboard.*` 全部入总线（read/list/count/image_preview/get_monitor/shortcut 只读，write/write_back/set_pin/set_favorite/set_monitor/open_window/close_window 变更，delete/clear 破坏性），`ClipItem` 上移 orbit-core，剪贴板实现改为普通函数、旧入口薄委托；非空参数强类型并拒绝多余字段。2026-11-10 完成阶段 4 第一批：先把事件通道纳入契约（`orbit-core::event_catalog` 登记 `system-metrics` / `clip://changed` / `clip://shown` / `region-selection-start`，`bus::emit` 发送前校验 id，事件不写审计），再迁移纯请求-响应 7 条命令（`record.start/stop`、`ocr.image`、`ocr.current_screen`、`kb_record.start/stop`、`convert.format`），实现改为 `pub(crate)` 普通函数、旧入口薄委托；`KbEvent` 同时上移 orbit-core。已入总线共 38 条，未迁移能力 0 条。2026-11-10 完成阶段 4 第二批：区域选区 3 条（`region.start/finish/cancel`）先定契约再迁移——结果由 `region.finish` 同步返回内层 `screenshot.capture` 的 `CommandResponse`，不发 `region-selection-end`、不发拖拽 `update` 事件，`region.cancel` 幂等且无截图/剪贴板副作用；`start_region_selection_impl` / `finish_region_selection_impl` / `cancel_region_selection_impl` 为普通函数，旧入口薄委托。提权 2 条（`elevated.set/status`）按单独评估迁移：先抽 `src-tauri/src/elevated.rs` 收敛 flag/live 文件握手、UAC 拉起与 `ElevatedError` 文案映射，再入总线；`elevated.status` 返回「用户意图 || helper 存活」，helper 静默死亡时降级为 false，温度 live 文件缺失/超过 30 秒即返回 null，仪表盘隐藏该格而不估算。阶段 3 补齐 3 个最小冒烟（真实剪贴板写入读回并恢复、收藏落库、1x1 PNG 缩略图 data URL），确认二进制透传策略为「磁盘文件 + base64 data URL 字符串」，IPC 不传裸字节；阶段 4 另补 4 条重路径实机冒烟（ffmpeg 录制出片、合成图 OCR、截屏后整屏 OCR、wav→mp3 转换），7 条冒烟均已在本机通过。2026-11-10 完成阶段 5 收尾：前端新增 `src/bus.ts` 的 `runCommand()`，App/ClipboardPanel/SystemMonitor 的全部调用改走 `execute_command`；删除 34 个旧直连 `#[tauri::command]` 薄委托与 `delegate_via_bus`，`invoke_handler` 仅注册 `get_command_catalog` 与 `execute_command`，Direct IPC 段归零；重建 release 实机启动，审计连续记录 `system.dash` / `overlay.dock` / `clipboard.list` 且均单条 `ok`。2026-11-11 新增第 38 条命令 `overlay.layout`：`WindowSize` / `WindowLayout` 契约上移 orbit-core（ts-rs 生成 35 个 TS 绑定），主进程 `layout_config` 从 `tauri.conf.json` 读取三个窗口初始尺寸并集中停靠/展开态尺寸，前端 `App.svelte` 挂载时把配置注入 `:root` CSS 变量，悬浮球四态、刘海条、设置/监控面板与剪贴板面板全部按配置尺寸渲染，修正侧边态 Rust 54×132 与 CSS 44×120 的漂移；圆盘几何以 340 基准 viewBox 自动等比缩放。 |
+| P0-3 命令契约与命令总线 | 已实现 | 2026-11-09 完成总线注册表化改造：新增 `src-tauri/src/bus.rs`，`bus::execute` 查表路由（契约来自 orbit-core::command_catalog 单一事实源，强类型 params 反序列化 + deny_unknown_fields，同步处理器跑阻塞线程池），审计改为后台异步写入不阻塞响应，`get_command_catalog` 直接读注册表保证目录与可路由命令一致。2026-11-10 完成阶段 2：`system.monitor`、`overlay.dock`、`overlay.set_open`、`app.setup.status`、`app.setup.complete`、`app.autostart.set`、`app.quit` 入总线。2026-11-10 完成阶段 3：15 条 `clipboard.*` 全部入总线（read/list/count/image_preview/get_monitor/shortcut 只读，write/write_back/set_pin/set_favorite/set_monitor/open_window/close_window 变更，delete/clear 破坏性），`ClipItem` 上移 orbit-core，剪贴板实现改为普通函数、旧入口薄委托；非空参数强类型并拒绝多余字段。2026-11-10 完成阶段 4 第一批：先把事件通道纳入契约（`orbit-core::event_catalog` 当时登记 `system-metrics` / `clip://changed` / `clip://shown` / `region-selection-start`，`bus::emit` 发送前校验 id，事件不写审计；`system-metrics` 已于 2026-11-11 因前端无消费者而移除），再迁移纯请求-响应 7 条命令（`record.start/stop`、`ocr.image`、`ocr.current_screen`、`kb_record.start/stop`、`convert.format`），实现改为 `pub(crate)` 普通函数、旧入口薄委托；`KbEvent` 同时上移 orbit-core。当时已入总线共 38 条，未迁移能力 0 条。2026-11-10 完成阶段 4 第二批：区域选区 3 条（`region.start/finish/cancel`）先定契约再迁移——结果由 `region.finish` 同步返回内层 `screenshot.capture` 的 `CommandResponse`，不发 `region-selection-end`、不发拖拽 `update` 事件，`region.cancel` 幂等且无截图/剪贴板副作用；`start_region_selection_impl` / `finish_region_selection_impl` / `cancel_region_selection_impl` 为普通函数，旧入口薄委托。提权 2 条（`elevated.set/status`）按单独评估迁移：先抽 `src-tauri/src/elevated.rs` 收敛 flag/live 文件握手、UAC 拉起与 `ElevatedError` 文案映射，再入总线；`elevated.status` 返回「用户意图 || helper 存活」，helper 静默死亡时 status 仍反映用户意图（true）以便重试，温度 live 文件缺失/超过共享的 30 秒新鲜度阈值即返回 null，仪表盘隐藏该格而不估算。阶段 3 补齐 3 个最小冒烟（真实剪贴板写入读回并恢复、收藏落库、1x1 PNG 缩略图 data URL），确认二进制透传策略为「磁盘文件 + base64 data URL 字符串」，IPC 不传裸字节；阶段 4 另补 4 条重路径实机冒烟（ffmpeg 录制出片、合成图 OCR、截屏后整屏 OCR、wav→mp3 转换），当时 7 条冒烟均已在本机通过。2026-11-10 完成阶段 5 收尾：前端新增 `src/bus.ts` 的 `runCommand()`，App/ClipboardPanel/SystemMonitor 的全部调用改走 `execute_command`；删除 34 个旧直连 `#[tauri::command]` 薄委托与 `delegate_via_bus`，`invoke_handler` 仅注册 `get_command_catalog` 与 `execute_command`，Direct IPC 段归零；重建 release 实机启动，审计连续记录 `system.dash` / `overlay.dock` / `clipboard.list` 且均单条 `ok`。2026-11-11 新增第 38 条命令 `overlay.layout`：`WindowSize` / `WindowLayout` 契约上移 orbit-core（ts-rs 生成 38 个 TS 绑定），主进程 `layout_config` 从 `tauri.conf.json` 读取三个窗口初始尺寸并集中停靠/展开态尺寸，前端 `App.svelte` 挂载时把配置注入 `:root` CSS 变量，悬浮球四态、刘海条、设置/监控面板与剪贴板面板全部按配置尺寸渲染，修正侧边态 Rust 54×132 与 CSS 44×120 的漂移；圆盘几何以 340 基准 viewBox 自动等比缩放。2026-11-11 参考 LiteParse 的 OCR 契约完成结构化改造：`OcrResult` / `OcrLine` / `OcrWord` 契约上移 orbit-core，PowerShell 脚本改为输出 UTF-8 JSON（WinRT `BoundingRect` → `[x1,y1,x2,y2]` bbox，行 bbox 由词框合并），`parse_ocr_output` 明确拒绝非 JSON 与空输出，两条 `ocr.*` 命令返回结构化结果，前端写回纯文本并显示行/词统计；合成图与整屏 OCR 冒烟已验证词级 bbox 为有效矩形。Windows.Media.Ocr 不提供置信度，契约不伪造该字段。2026-11-11 参考 Kiri 完成录屏小修 demo：`CaptureRegion` / `RecordStartParams` / `RecordStateEvent` / `RecoveryItem` 契约上移 orbit-core（当时生成 42 个 TS 绑定，现为 41 个），新增第 39 条命令 `record.recovery.list` 与 `record-state` 事件；`record.start` 接受可选区域参数（显示器内物理像素经显示器 origin 换算为 gdigrab 虚拟桌面绝对坐标，插入 `-offset_x/-offset_y/-video_size`），录制期间隐藏 `main` 悬浮球并把 `Alt+V` 临时改为停止入口，停止过程发 `started/saving/saved/recovering` 状态事件；收尾 8 秒超时强杀时把可能不完整的 MP4 移入 `app_data_dir()/record-recovery/` 并原子写 `recovery.json` manifest，`record.recovery.list` 只读列出；前端订阅 `record-state` 并在 `recovering` 时读取恢复区清单；冒烟升级为 ffprobe 反读 mp4 元数据（h264 / 时长）并新增 320×240 区域录制尺寸校验。2026-11-11 完成一致性整理：删除每秒采样但前端不消费的 `system-metrics` 事件（事件降至 4 个、绑定降至 41 个），`App.svelte` / `ClipboardPanel.svelte` / `SystemMonitor.svelte` 全部改用 ts-rs 生成绑定并给契约里的 64 位字段加 `#[ts(type = "number")]` 消除 bigint 漂移，release 也注册 log 插件（Warn 级别）避免告警静默，温度读取抽出共享 `LIVE_STALE` 常量并把零断言测试换成真实断言，`enigo` 收敛为测试专用依赖、移除 `sysinfo` 的 `component` / `disk` feature 与 helper 的 `--query` 死分支，`region-capture-result` 在契约里明确为前端跨窗口事件例外。 |
 | P0-4 截图管线 | 已实现 | xcap 支持全屏多显示器合成与按显示器坐标区域截图，并直接写入剪贴板；独立透明选区窗口、Escape/右键取消已接入。 |
-| P1 核心能力 | 部分实现 | 圆盘扇区入口均已接线（布局可拖拽自定义）：截图、剪贴板闭环可用；录屏依赖用户自装 FFmpeg（优雅停止已修复）；OCR 已实测可用但仅返回纯文本；键鼠录制可干净停止并落库（回放未实现）；格式转换支持 5 种目标格式选择（无进度事件）；MCP 扇区为占位提示。事件绑定层、全局快捷键自定义未实现。 |
+| P1 核心能力 | 部分实现 | 圆盘扇区入口均已接线（布局可拖拽自定义）：截图、剪贴板闭环可用；录屏依赖用户自装 FFmpeg，已补区域录制、录制期隐藏悬浮球 + `Alt+V` 停止入口、收尾失败恢复区与 `record-state` 事件，ffprobe 冒烟验证 mp4 完整；OCR 返回结构化结果（文本 + 行/词 + bbox），写回剪贴板仍为纯文本；键鼠录制可干净停止并落库（回放未实现）；格式转换支持 5 种目标格式选择（无进度事件）；MCP 扇区为占位提示。事件绑定层、全局快捷键自定义未实现。 |
 | Windows 安装器 | 已构建并实机安装 | 已产出 3.63 MiB NSIS 0.1.0 安装包，中文界面（`SimpChinese`）、currentUser 安装模式、安装/卸载器图标与多尺寸 exe 图标均已嵌入；未签名。GitHub Actions 可手动触发或由匹配 `package.json` 版本的 `v*` 标签触发。 |
 
-**已完成的工程验证：** 前端检查/构建通过；Rust 单测覆盖贴边判定、审计记录和命令类型生成；Windows x64 NSIS 安装包（3.63 MiB）已在 Windows 实机安装并启动；`PrivateExtractIcons` 验证 exe 内含 16/32/48/64/128/256 六档图标；清理 Windows 图标缓存后 `SHGetFileInfo` 解析结果与 `logo.svg` 一致。以上不等于已完成全屏游戏覆盖或长时稳定性验收。尚无 macOS 实机验证，也未测量 P-01 至 P-10 的性能基线。
+**已完成的工程验证：** 前端检查/构建通过；Rust 单测覆盖贴边判定、审计记录、命令/事件目录完整性、命令类型生成、gdigrab 区域参数构造、恢复区 manifest 往返、温度读取可注入路径与 release 日志级别；实机冒烟用 ffprobe 反读录屏产物（全屏元数据 + 320×240 区域尺寸）；Windows x64 NSIS 安装包（3.63 MiB）已在 Windows 实机安装并启动；`PrivateExtractIcons` 验证 exe 内含 16/32/48/64/128/256 六档图标；清理 Windows 图标缓存后 `SHGetFileInfo` 解析结果与 `logo.svg` 一致。以上不等于已完成全屏游戏覆盖或长时稳定性验收。尚无 macOS 实机验证，也未测量 P-01 至 P-10 的性能基线。
 
-**当前主要风险与下一步：** 2026-11-09 命令总线完成注册表化骨架并迁移首批 3 条命令；2026-11-10 完成阶段 2（覆盖层/一键设置/登录启动/退出共 7 条）、阶段 3（剪贴板 15 条）、阶段 4 第一批（事件通道契约 + 录屏/OCR/键鼠/转换 7 条）、第二批（区域选区 3 条 + 提权 2 条）、阶段 5 收尾，总线现覆盖全部 38 条命令且无直连能力，旧入口薄委托已删除（`invoke_handler` 仅剩 `get_command_catalog` 与 `execute_command`，前端统一走 `src/bus.ts` 的 `runCommand`），审计异步化；2026-11-11 新增 `overlay.layout` 统一发布窗口尺寸配置，所有弹窗按配置尺寸渲染；`cargo check --workspace`、`cargo test -p orbit-core`（41 项）、`cargo test -p orbit-desktop --lib`（24 项，含 7 条实机冒烟）、`npm run check` / `npm run build` 全部通过。下一步：实机验证 `overlay.layout` 首帧 CSS 变量注入、选区事件流（`region-selection-start` 需真实取景框交互）与 `elevated.status` 审计行；再补事件绑定层与全局快捷键自定义、键鼠回放（enigo）、只读 MCP sidecar（独立进程，stdio JSON-RPC）；最后补性能、安全、长时测试。普通置顶窗口无法保证显示在独占全屏游戏之上；若游戏覆盖和 FPS 是优先目标，需另选游戏/遥测接口，不作为普通窗口已有能力。
+**当前主要风险与下一步：** 2026-11-09 命令总线完成注册表化骨架并迁移首批 3 条命令；2026-11-10 完成阶段 2（覆盖层/一键设置/登录启动/退出共 7 条）、阶段 3（剪贴板 15 条）、阶段 4 第一批（事件通道契约 + 录屏/OCR/键鼠/转换 7 条）、第二批（区域选区 3 条 + 提权 2 条）、阶段 5 收尾，总线现覆盖全部 39 条命令且无直连能力，旧入口薄委托已删除（`invoke_handler` 仅剩 `get_command_catalog` 与 `execute_command`，前端统一走 `src/bus.ts` 的 `runCommand`），审计异步化，事件通道在移除无消费者的 `system-metrics` 后保留 4 个 id；2026-11-11 新增 `overlay.layout` 统一发布窗口尺寸配置，所有弹窗按配置尺寸渲染；同日参考 LiteParse 把两条 `ocr.*` 命令升级为结构化返回（文本 + 行/词 + bbox），合成图与整屏 OCR 冒烟已验证词级 bbox；再参考 Kiri 完成录屏小修 demo（零新依赖：区域录制参数、录制期隐藏悬浮球并把 `Alt+V` 临时改为停止入口、`record-state` 状态事件、收尾超时恢复区与 `record.recovery.list` 清单、前端订阅事件、ffprobe 冒烟升级），未引入 WGC / Media Foundation 原生采集管线；同日晚些完成一致性整理：删除无消费者的 `system-metrics` 采样线程/契约/绑定，前端三个组件全部改用 ts-rs 生成绑定（契约 64 位字段统一 `#[ts(type = "number")]`，消除 bigint 漂移），release 注册日志插件保留告警，温度读取抽共享 `LIVE_STALE` 常量并把零断言测试换成真实断言，`enigo` 改为 dev-dependency、移除 `sysinfo` 的 `component` / `disk` feature 与 helper `--query` 死分支，`region-capture-result` 在契约中明确为前端跨窗口事件例外；`cargo check --workspace`、`cargo test -p orbit-core`（51 项）、`cargo test -p orbit-desktop --lib`（34 项，含 8 条实机冒烟）、`cargo test --workspace`（87 项）、`npm run check` / `npm run build` 全部通过。下一步：实机验证 release 告警日志落盘、录制期隐藏悬浮球后 `Alt+V` 停止、`record-state` 事件回流与恢复区提示，以及 `overlay.layout` 首帧 CSS 变量注入与 OCR 中文 UTF-8 输出、选区事件流（`region-selection-start` 需真实取景框交互）与 `elevated.status` 审计行；抽象可插拔 `OcrEngine`（PaddleOCR HTTP sidecar）并做无文字预检以避开 PowerShell 冷启动；再补事件绑定层与全局快捷键自定义、键鼠回放（enigo）、只读 MCP sidecar（独立进程，stdio JSON-RPC）；最后补性能、安全、长时测试。普通置顶窗口无法保证显示在独占全屏游戏之上；若游戏覆盖和 FPS 是优先目标，需另选游戏/遥测接口，不作为普通窗口已有能力。
 
 ## 一、项目概述
 Orbit 是一个以悬浮球为唯一常驻入口、以轮盘和事件绑定为交互壳、以命令总线为执行内核、以 MCP 为外部扩展面的桌面自动化工具。悬浮球是中心天体，轮盘是径向轨道，命令是环绕运行的卫星，MCP 是外部轨道接口——四层含义统一在一个名字里。
@@ -146,7 +146,7 @@ orbit/
 ├── crates/
 │   └── orbit-core/                 # 命令契约、TS 绑定生成、SQLite 审计
 │       ├── src/
-│       │   ├── contract.rs         # CommandSpec / RiskLevel / WindowLayout + command_catalog / event_catalog
+│       │   ├── contract.rs         # CommandSpec / WindowLayout / OcrResult + command_catalog / event_catalog
 │       │   ├── audit.rs            # 审计日志（SQLite，user_version 迁移）
 │       │   └── lib.rs
 │       └── bindings/               # ts-rs 生成的 TypeScript 类型
@@ -157,12 +157,16 @@ orbit/
 │   │   ├── bus.rs                  # 命令注册表、路由、事件发射、审计
 │   │   ├── elevated.rs             # 管理员 helper 握手、UAC 拉起、错误映射
 │   │   ├── clipboard.rs            # 剪贴板事件采集 + SQLite 历史 + 独立面板窗口
+│   │   ├── input_recorder.rs       # 原生键鼠钩子录制（回放未实现）
 │   │   ├── screenshot.rs           # xcap 捕获与剪贴板直写
-│   │   └── helper/main.rs          # orbit-elevated-helper 提权 sidecar（温度/磁盘）
+│   │   └── helper/main.rs          # orbit-elevated-helper 提权 sidecar（温度常驻 watch）
+│   ├── build.rs                    # 图标资源 / tauri-build（helper manifest 未嵌入）
+│   ├── helper-manifest/            # 备用 requireAdministrator manifest（当前未启用）
 │   ├── tauri.conf.json
 │   └── capabilities/
 ├── src/                            # Svelte 5 前端
 │   ├── App.svelte                  # 悬浮球交互、可编辑扇区圆盘、灵动岛、设置入口
+│   ├── app.css                     # 全局样式与窗口尺寸首帧兜底 CSS 变量
 │   ├── bus.ts                      # 前端唯一命令入口 runCommand → execute_command
 │   ├── OrbGalaxy.svelte            # Canvas 2D 银河旋涡
 │   ├── SystemMonitor.svelte        # 系统指标面板
@@ -291,11 +295,11 @@ CREATE TABLE audit_log (
 | --- | --- |
 | 移动阈值拖拽 | 按压后位移 > 4px 才调用 startDragging() |
 | 双击检测 | e.detail === 2 在 mousedown 阶段判定，第二次按压不启动拖拽 |
-| 右键菜单 | Tauri 原生 ContextMenu::popup(window)，菜单项 ID 加 orb-- 前缀避免与托盘冲突 |
+| 右键菜单 | `<svelte:window oncontextmenu>` 由前端 `handleContextMenu` 拦截并 preventDefault；选区中用于取消取景，其余情况打开设置面板，不使用 Tauri 原生菜单 |
 | 事件阻断 | 拖拽启动后，当前按压周期内的 click 绑定不触发 |
 #### P0-3 命令契约层与单一事实源
 
-进度：命令契约、TypeScript 类型、JSON Schema、SQLite `user_version` 迁移与审计写入已接入；命令总线路由 38 条能力（截图、系统信息/仪表盘/监视器、覆盖层停靠/展开/尺寸配置、一键设置/登录启动/退出、15 条剪贴板命令、录屏 2、OCR 2、键鼠录制 2、格式转换 1、区域选区 3、提权 2），无 Tauri IPC 直连能力；事件通道 4 个 id 由 `event_catalog` 统一登记并由 `bus::emit` 校验。完整命令目录与风险分级已完成，审计轮转、`denied` 状态与来源标记尚未实现。
+进度：命令契约、TypeScript 类型、JSON Schema、SQLite `user_version` 迁移与审计写入已接入；命令总线路由 39 条能力（截图、系统信息/仪表盘/监视器、覆盖层停靠/展开/尺寸配置、一键设置/登录启动/退出、15 条剪贴板命令、录屏 3、OCR 2、键鼠录制 2、格式转换 1、区域选区 3、提权 2），无 Tauri IPC 直连能力；事件通道 4 个 id 由 `event_catalog` 统一登记并由 `bus::emit` 校验（前端跨窗口的 `region-capture-result` 不经过 Rust，是明确例外）。完整命令目录与风险分级已完成，审计轮转、`denied` 状态与来源标记尚未实现。
 
 CommandSpec 定义于 orbit-core；当前采用 ts-rs 生成 TypeScript、schemars 生成 JSON Schema。生成文件由 Rust 契约测试维护。
 
@@ -305,7 +309,7 @@ CommandSpec 定义于 orbit-core；当前采用 ts-rs 生成 TypeScript、schema
 
 #### P0-4 截图管线（xcap）
 
-进度：xcap 全屏多显示器合成、区域截图以及 RGBA 内存直写剪贴板已接入；前端提供全屏截图和透明屏幕框选入口，区域选取期间隐藏主窗口以避免选区层进入截图。Windows 实机截图链路已跑通。录屏当前为 FFmpeg gdigrab 子进程原型（见 P2-1），停止时向 stdin 写 `q` 优雅退出（8 秒超时兜底强杀），已实测产出完整 mp4。
+进度：xcap 全屏多显示器合成、区域截图以及 RGBA 内存直写剪贴板已接入；前端提供全屏截图和透明屏幕框选入口，区域选取期间隐藏主窗口以避免选区层进入截图。Windows 实机截图链路已跑通。录屏当前为 FFmpeg gdigrab 子进程原型（见 P2-1），已支持可选区域录制、录制期隐藏悬浮球、失败恢复区与状态事件；停止时向 stdin 写 `q` 优雅退出（8 秒超时兜底强杀），实机冒烟用 ffprobe 反读元数据确认 mp4 尾部完整。
 
 全屏截图、区域截图、多显示器支持。
 
@@ -325,7 +329,7 @@ CommandSpec 定义于 orbit-core；当前采用 ts-rs 生成 TypeScript、schema
 验收：应用启动后直接显示可拖动悬浮球；点击可触发一次设置并反馈登录启动结果；权限未经操作系统确认时不得报告为已授权；用户后续关闭登录启动后设置立即生效。
 
 ### P1 — 高频核心能力与可编程交互（第 3–6 周）
-进度：命令总线已路由 38 条命令（含 `overlay.layout`），无 Tauri IPC 直连命令；可编辑扇区与半径的圆盘（拖拽排序、拖到中心或拖出删除、内外圈半径可调，布局与半径存 localStorage）、截图到剪贴板、剪贴板历史、主题（5 套 CSS 变量主题，默认 Orbit 白）与系统监控已实现；窗口与弹窗尺寸由 `tauri.conf.json` + `layout_config` 统一发布；录屏、OCR、键鼠录制、格式转换为带已知缺陷的原型（见 P2 各节进度）；事件绑定层与全局快捷键自定义、MCP 仍未实现。
+进度：命令总线已路由 39 条命令（含 `overlay.layout` 与 `record.recovery.list`），无 Tauri IPC 直连命令，事件通道 4 个 id；可编辑扇区与半径的圆盘（拖拽排序、拖到中心或拖出删除、内外圈半径可调，布局与半径存 localStorage）、截图到剪贴板、剪贴板历史、主题（5 套 CSS 变量主题，默认 Orbit 白）与系统监控已实现；窗口与弹窗尺寸由 `tauri.conf.json` + `layout_config` 统一发布；录屏、OCR、键鼠录制、格式转换为带已知缺陷的原型（见 P2 各节进度）；事件绑定层与全局快捷键自定义、MCP 仍未实现。
 
 #### P1-1 双模式轮盘
 
@@ -378,20 +382,20 @@ bindings.json 的版本化：version 字段 + 启动时迁移函数，新增事�
 
 #### P1-6 OCR（系统原生）
 
-进度：Windows 已实现并实测——通过 PowerShell 调用 Windows.Media.Ocr，`ocr_current_screen` 截取悬浮球当前所在显示器（多显示器环境正确映射），识别结果写回剪贴板；命令为异步执行，临时 PNG 文件名唯一且 RAII 清理。2026-11-09 修复：路径改经环境变量传入（消除单引号破坏/注入风险）；`Await` 改用反射调用泛型 AsTask（原写法在 PowerShell 下报 MethodCountCouldNotFindBest，实际无法运行），已用含单引号路径实测识别通过。已知限制：只返回纯文本（无 blocks/bbox/confidence）；PowerShell 冷启动开销大。macOS Vision 与 Linux 后端未实现。
+进度：Windows 已实现并实测——通过 PowerShell 调用 Windows.Media.Ocr，`ocr.current_screen` 截取悬浮球当前所在显示器（多显示器环境正确映射），识别结果写回剪贴板；命令为异步执行，临时 PNG 文件名唯一且 RAII 清理。2026-11-09 修复：路径改经环境变量传入（消除单引号破坏/注入风险）；`Await` 改用反射调用泛型 AsTask（原写法在 PowerShell 下报 MethodCountCouldNotFindBest，实际无法运行），已用含单引号路径实测识别通过。2026-11-11 参考 LiteParse 改造为结构化输出：`OcrResult { text, lines, textAngle }` / `OcrLine` / `OcrWord`，bbox 为 `[x1,y1,x2,y2]`（图像左上为原点，来自 WinRT `BoundingRect`，行框由词框合并），PowerShell stdout 设为 UTF-8 并输出紧凑 JSON，Rust 侧 `parse_ocr_output` 拒绝非 JSON/空输出；前端仍把 `result.text` 写回剪贴板，同时展示行/词统计。合成图与整屏 OCR 冒烟实测词级 bbox 为有效矩形。已知限制：Windows.Media.Ocr 不提供置信度，契约不伪造该字段（未来 HTTP OCR 后端可补）；PowerShell 冷启动开销大，尚无「无文字跳过识别」预检；macOS Vision 与 Linux 后端未实现。
 
 macOS：Vision framework VNRecognizeTextRequest
 
 Windows：Windows.Media.Ocr
 
-返回 { text, blocks: [{ bbox, text, confidence }] }，支持“截图 → OCR → 剪贴板 / 翻译命令”链路。
+实际返回 `OcrResult { text, lines: [{ text, bbox, words: [{ text, bbox }] }], textAngle }`（bbox 为 `[x1,y1,x2,y2]`，详见 docs/CONTRACTS.md）；Windows.Media.Ocr 不提供置信度，契约不伪造 confidence 字段。当前链路为“截图 → OCR → 剪贴板”，翻译命令尚未接入。
 
 Linux 首版 OCR 能力尚未定案：可将 Tesseract 作为可选后端，或明确标记为暂不支持；不要在兼容矩阵中承诺尚未进入排期的能力。中文识别率不达标时，可评估 PaddleOCR sidecar 作为显式启用的可选增强。
 
 ### P2 — 重型能力、主题系统与 MCP 暴露（第 7–15 周）
 #### P2-1 录屏原生管线
 
-进度：Windows 原型已接入，但与下表目标架构不同——当前用 FFmpeg `gdigrab` 子进程全屏录制（30fps、libx264、4Mbps），输出到 `桌面/Orbit/orbit_rec_*.mp4`；FFmpeg 需用户自装（PATH / `FFMPEG_PATH` / sidecar 资源目录），未随安装包分发。停止时向 stdin 写 `q` 优雅退出（8 秒超时兜底强杀），已实测 mp4 完整；重复启动有守卫。已知缺陷：无音轨；无区域/窗口模式；无崩溃恢复。原生管线（Windows.Graphics.Capture 等）仍是后续目标。
+进度：Windows 原型已接入，但与下表目标架构不同——当前用 FFmpeg `gdigrab` 子进程录制（30fps、libx264、4Mbps），输出到 `桌面/Orbit/orbit_rec_*.mp4`；FFmpeg 需用户自装（PATH / `FFMPEG_PATH` / sidecar 资源目录），未随安装包分发。2026-11-11 参考 Kiri 做零新依赖小修：`record.start` 接受可选 `region`（`monitorId/x/y/width/height`，显示器内物理像素经显示器 origin 换算成 `-offset_x/-offset_y/-video_size` 的虚拟桌面绝对坐标），缺省仍录整块桌面；`ffmpeg_record_args` 单测覆盖两种参数，实机冒烟用 ffprobe 反读 320×240 区域产物的宽高与 h264/时长元数据。gdigrab 无法排除自身窗口，故录制期间隐藏 `main` 悬浮球，并把 `Alt+V` 全局快捷键临时改为停止入口，停止后恢复显示与剪贴板语义；`record-state` 事件发布 `started/saving/saved/recovering`，前端订阅以同步状态。收尾向 stdin 写 `q` 优雅退出，8 秒超时才强杀；强杀时把可能不完整的 MP4 移入 `app_data_dir()/record-recovery/`，并以临时文件原子重命名写 `recovery.json` manifest，`record.recovery.list` 只读列出清单。重复启动有守卫。已知缺陷：仍无音轨、无窗口模式、无渐进式写盘；恢复区只保留收尾超时的文件，不是真正的崩溃恢复；原生管线（Windows.Graphics.Capture / Media Foundation）仍是后续目标。
 
 | 平台 | API | 编码 |
 | --- | --- | --- |
@@ -410,13 +414,13 @@ Linux 首版 OCR 能力尚未定案：可将 Tesseract 作为可选后端，或�
 
 #### P2-2 键鼠录制与回放
 
-进度：Windows 录制已实现并实测——改用原生低级钩子（WH_KEYBOARD_LL / WH_MOUSE_LL，独立线程 + 消息循环），停止时 PostThreadMessage(WM_QUIT) + UnhookWindowsHookEx 干净卸载（2026-11-09 替换 rdev::listen，修复其无法停止导致的线程泄漏）；事件含按键名/坐标/按钮/滚轮方向，停止后自动持久化到应用数据目录 `recordings.db`（SQLite，JSON 事件流，user_version=1）。集成测试验证合成按键捕获、干净停止与重复启动。已知限制：enigo 回放未实现（依赖已引入）；无倍速/循环；事件格式未用 MessagePack（规划项）。Linux/macOS 未实现。
+进度：Windows 录制已实现并实测——改用原生低级钩子（WH_KEYBOARD_LL / WH_MOUSE_LL，独立线程 + 消息循环），停止时 PostThreadMessage(WM_QUIT) + UnhookWindowsHookEx 干净卸载（2026-11-09 替换 rdev::listen，修复其无法停止导致的线程泄漏）；事件含按键名/坐标/按钮/滚轮方向，停止后自动持久化到应用数据目录 `recordings.db`（SQLite，JSON 事件流，user_version=1）。集成测试验证合成按键捕获、干净停止与重复启动。已知限制：enigo 回放未实现（该依赖已收敛为 Windows 测试专用，仅用于合成按键验证，不进入生产二进制）；无倍速/循环；事件格式未用 MessagePack（规划项）。Linux/macOS 未实现。
 
-录制：rdev::listen 放独立线程（阻塞），事件序列化到 SQLite。
+录制（已实现）：Windows 走 WH_KEYBOARD_LL / WH_MOUSE_LL 低级钩子，独立线程 + 消息循环，事件序列化到 SQLite。
 
-回放：enigo 模拟，按时间戳调度，支持倍速和循环。
+回放（规划，未实现）：enigo 模拟，按时间戳调度，支持倍速和循环。
 
-兼容性边界：rdev::listen 依赖 X11，Wayland 原生会话下不工作；rdev::grab 走 evdev 在 X11 和 Wayland 下均可拦截但权限模型不同。Linux 支持范围明确限定为 X11 / XWayland。
+兼容性边界：Windows 已用原生低级钩子实现，不再依赖 rdev；Linux/macOS 后端尚未实现，后续移植需分别评估 X11/Wayland 与权限模型，不在当前兼容矩阵承诺范围内。
 
 回放精度：通过“绝对时间戳 + 补偿调度”而非“sleep 累加”，减少累积漂移。
 
@@ -424,11 +428,9 @@ Linux 首版 OCR 能力尚未定案：可将 Tesseract 作为可选后端，或�
 
 进度：已实现并实测——前端圆盘内弹出格式选择卡（MP3/WAV/MP4/GIF/WebP），选文件 → 选格式 → 选保存路径；后端 `convert.format` 异步执行，格式白名单校验，FFmpeg 查找与录屏统一（FFMPEG_PATH → sidecar 资源 → PATH），失败时返回 stderr 尾部详情。五种格式参数已用真实 FFmpeg 逐一验证。已知限制：无进度事件（转换期间仅提示文案）；拖拽触发未接入；FFmpeg 仍需用户自装。
 
-FFmpeg 子进程，命令参数封装为 convert.audio、convert.video、convert.image。
+FFmpeg 子进程，命令总线上只有一条 `convert.format`（参数携带目标格式白名单）；`convert.audio` / `convert.video` / `convert.image` 是早期规划命名，未实现。
 
-走重路径，进度通过 Tauri 事件推送到前端。
-
-支持拖拽文件到悬浮球触发（与 drop 事件绑定联动）。
+走重路径；进度事件尚未实现（当前转换期间仅前端提示文案），支持拖拽触发也未接入，见上文已知限制。
 
 #### P2-4 主题系统
 
@@ -454,8 +456,8 @@ v2（ZIP 主题包） ：主题包含 theme.json、index.css、可选 preview.jp
 
 | 周 | 任务 | 交付物 |
 | --- | --- | --- |
-| W1 | Tauri 最小悬浮窗、DWM 禁用、xcap 全屏截图、rdev 监听 | 三平台性能基线初稿 |
-| W1 | 4px 阈值 + 双击检测 + 原生右键菜单 demo | 冲突框架可运行 demo |
+| W1 | Tauri 最小悬浮窗、DWM 禁用、xcap 全屏截图、键鼠监听（Windows 已改用原生低级钩子，早期规划为 rdev） | 三平台性能基线初稿 |
+| W1 | 4px 阈值 + 双击检测 + 右键菜单冲突 demo（实际实现为前端拦截 + 设置面板） | 冲突框架可运行 demo |
 | W2 | 三平台完整性能基线（冷启动、内存、截图、抖动） | docs/PERF.md 初版 |
 | W2 | 全局快捷键注册失败路径与注销验证 | 失败路径测试报告 |
 | W2 | 权限能力矩阵与登录启动原型 | 悬浮球一键设置反馈、启动项开关验证 |

@@ -3,4 +3,4 @@
 /**
  * 灵动岛仪表盘实时数据（CPU / 内存 / 开机时长 / 温度 / 剪贴板条数）。
  */
-export type DashInfo = { cpuPercent: number, memoryUsedPercent: number, memoryUsedMb: bigint, memoryTotalMb: bigint, uptimeSecs: bigint, timeNow: string, clipboardCount: number, temperatureC: number | null, };
+export type DashInfo = { cpuPercent: number, memoryUsedPercent: number, memoryUsedMb: number, memoryTotalMb: number, uptimeSecs: number, timeNow: string, clipboardCount: number, temperatureC: number | null, };

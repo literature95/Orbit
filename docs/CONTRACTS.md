@@ -32,10 +32,11 @@ The shared command types live in `crates/orbit-core`. TypeScript bindings are ge
 | `clipboard.clear` | Destructive | `EmptyParams` (`{}`) | `null` |
 | `clipboard.open_window` | Mutating (shows window) | `EmptyParams` (`{}`) | `null` |
 | `clipboard.close_window` | Mutating (hides window) | `EmptyParams` (`{}`) | `null` |
-| `record.start` | Mutating (spawns ffmpeg) | `EmptyParams` (`{}`) | `string`: output path |
+| `record.start` | Mutating (spawns ffmpeg) | `RecordStartParams` (`{ region? }`) | `string`: output path |
 | `record.stop` | Mutating (stops ffmpeg) | `EmptyParams` (`{}`) | `string \| null`: output path |
-| `ocr.image` | ReadOnly | `OcrImageParams` (`{ imagePath }`) | `string`: recognized text |
-| `ocr.current_screen` | ReadOnly | `EmptyParams` (`{}`) | `string`: recognized text |
+| `record.recovery.list` | ReadOnly | `EmptyParams` (`{}`) | `RecoveryItem[]`: staged recovery files |
+| `ocr.image` | ReadOnly | `OcrImageParams` (`{ imagePath }`) | `OcrResult`: text + lines/words with bbox |
+| `ocr.current_screen` | ReadOnly | `EmptyParams` (`{}`) | `OcrResult`: text + lines/words with bbox |
 | `kb_record.start` | Mutating | `EmptyParams` (`{}`) | `null` |
 | `kb_record.stop` | Mutating | `EmptyParams` (`{}`) | `KbEvent[]` |
 | `convert.format` | Mutating (spawns ffmpeg) | `ConvertFormatParams` (`{ inputPath, outputPath, format }`) | `string`: output path |
@@ -59,6 +60,18 @@ The 1x1 PNG smoke test (`image_preview_returns_base64_data_url`) pins this polic
 
 `overlay.layout` is the single source of truth for window and popup sizes. The host reads the three windows' initial sizes from `tauri.conf.json` (`main` 104×104, `clipboard` 420×560, `selection` 1×1) and keeps the side/notch/expanded sizes in `layout_config` (`src-tauri/src/lib.rs`); a missing config window is an error, not a duplicated fallback number. `App.svelte` injects the returned `WindowLayout` as CSS variables (`--orb-*-w/h`, `--orb-panel-inset`) at mount, so the orb's four states, the notch bar, the settings/monitor panels and the clipboard panel all follow the configured sizes. `:root` in `app.css` holds matching defaults for the first frame only. The disc SVG keeps a 340×340 `viewBox` as its geometry baseline and scales with the window, so changing a configured size does not require touching radius constants. The `selection` window is still resized to the whole monitor at runtime by `region.start`; that is capture behavior, not a layout contract.
 
+### Structured OCR output
+
+`ocr.image` and `ocr.current_screen` return `OcrResult { text, lines, textAngle }`. Each `OcrLine` carries `text`, `bbox` and its `words`; each `OcrWord` carries `text` and `bbox`. A bbox is `[x1, y1, x2, y2]` in pixels with the image top-left as origin — the same semantics as LiteParse's OCR HTTP contract — so a future PaddleOCR/Tesseract HTTP backend can be dropped in without changing the UI. Windows.Media.Ocr supplies `BoundingRect` for words; line bboxes are the union of their word boxes, and `textAngle` is nullable. Windows.Media.Ocr has no confidence score, so the contract deliberately omits it instead of fabricating `1.0`; an engine that does provide confidence can add the field later. The PowerShell script sets stdout to UTF-8 and emits compact JSON; `parse_ocr_output` in `src-tauri/src/lib.rs` rejects non-JSON and empty output explicitly. Still missing: macOS Vision and Linux backends, engine abstraction, and the cheap pre-check that avoids a PowerShell cold start when there is no text.
+
+### Recording region, state and recovery
+
+`record.start` takes `RecordStartParams { region: Option<CaptureRegion> }`. Omitting `region` records the whole desktop; `{}` is a valid call (the frontend `runCommand()` helper sends it by default). `CaptureRegion { monitorId, x, y, width, height }` uses physical pixels relative to that display — the same geometry semantics as `RegionFinishParams`. The host resolves `monitorId` against `xcap::Monitor::all()` and adds the display origin to produce gdigrab's virtual-desktop absolute coordinates; a zero width/height or an unknown monitor id is rejected before FFmpeg is spawned. Region recording inserts `-offset_x / -offset_y / -video_size` before `-i desktop`; `ffmpeg_record_args` is unit-tested with and without a region, and the smoke test records a 320×240 region and checks the dimensions back with `ffprobe`.
+
+gdigrab captures screen pixels and cannot exclude Orbit's own window, so `record.start` hides the `main` overlay and `record.stop` restores it. While a recording is active the `Alt+V` global shortcut temporarily becomes the stop entry (it otherwise toggles the clipboard window), so hiding the orb never strands a session. State changes are published as the `record-state` event with `RecordStateEvent { phase, path, message }`, where `phase` is `started` / `saving` / `saved` / `recovering`; the frontend `App.svelte` subscribes and keeps `recordingActive` and the notice in sync even when the stop came from the shortcut.
+
+Stop writes `q` to FFmpeg's stdin and waits up to 8 s. Only a forced kill (timed out) counts as a failure: the possibly truncated MP4 is moved to `app_data_dir()/record-recovery/`, and `recovery.json` is updated atomically via a `.tmp` rename with a `RecoveryItem { path, reason, createdAt, sizeBytes }`. `record.recovery.list` is a read-only, idempotent view of that manifest; the `recovering` event makes the frontend fetch it to report how many files are staged. A normal stop must not create recovery entries — both smoke tests assert `recovered == false` and read the MP4 metadata back with `ffprobe` (`codec_name=h264`, non-zero width, valid `format.duration`) to prove the MP4 tail is complete. This is a recovery area for incomplete files, not a WGC-style progressive-write crash recovery.
+
 ## Invocation and audit
 
 The command bus lives in `src-tauri/src/bus.rs`. It is a registry: each command id maps to a `CommandSpec` (from the `orbit-core::command_catalog` single source) plus a strongly-typed handler. `bus::execute` is the only entry point: registry lookup → typed param deserialization (`deny_unknown_fields`) → execution on the blocking pool → audit → `CommandResponse`. Unknown ids return an error response and are audited.
@@ -67,22 +80,22 @@ The Tauri UI invokes `execute_command` with a `CommandRequest`. The source is as
 
 Audit writes are asynchronous: they run in a background task and do not block the command response. If the audit write itself fails, the failure is logged and the command result is unaffected.
 
-The command catalog is available through `get_command_catalog`, which reads directly from the bus registry so the advertised catalog always matches routable commands. Shared request/response types (`SystemInfo`, `DashInfo`, `MonitorSnapshot`, `OverlaySnapshot`, `SetupResult`, `ClipItem`, `EmptyParams`, `SetOverlayOpenParams`, `SetAutostartParams`, `ClipListParams`, `ClipIdParams`, `ClipFlagParams`, `ClipWriteParams`, `ClipMonitorParams`, `OcrImageParams`, `ConvertFormatParams`, `KbEvent`, `RegionFinishParams`, `SetElevatedParams`) live in `orbit-core`; TypeScript bindings are generated by `ts-rs` during `cargo test -p orbit-core`, JSON Schema by `schemars` from the same types.
+The command catalog is available through `get_command_catalog`, which reads directly from the bus registry so the advertised catalog always matches routable commands. All shared request/response/event types are defined in `crates/orbit-core/src/contract.rs`, re-exported from `lib.rs`, and listed in the tables above; `cargo test -p orbit-core` regenerates 41 `.ts` bindings into `crates/orbit-core/bindings/` with `ts-rs`, while `schemars` produces JSON Schema from the same Rust types. The frontend imports these generated bindings directly and must not hand-write duplicate contract types.
 
-Non-empty parameter commands are strict: `SetOverlayOpenParams`, `SetAutostartParams`, all clipboard parameter types, `OcrImageParams`, `ConvertFormatParams`, `RegionFinishParams`, and `SetElevatedParams` use `deny_unknown_fields`, so `{ "open": true, "expanded": true }` is rejected instead of silently ignored. Callers must always send a params object (`{}` for no-arg commands) rather than `null`, because `EmptyParams` rejects `null`; the frontend `runCommand()` helper defaults to `{}`.
+Non-empty parameter commands are strict: `SetOverlayOpenParams`, `SetAutostartParams`, all clipboard parameter types, `OcrImageParams`, `RecordStartParams` (and its nested `CaptureRegion`), `ConvertFormatParams`, `RegionFinishParams`, and `SetElevatedParams` use `deny_unknown_fields`, so `{ "open": true, "expanded": true }` is rejected instead of silently ignored. Callers must always send a params object (`{}` for no-arg commands) rather than `null`, because `EmptyParams` rejects `null`; the frontend `runCommand()` helper defaults to `{}`.
 
 ## Events
 
-Events are not commands and are not audited. `orbit-core::event_catalog()` is the single source of truth for event ids and payload schemas; `bus::emit` rejects ids that are not registered, so a typo cannot silently produce an event no frontend listens to. `SystemMetrics`, `ClipboardChanged`, and `RegionSelectionStart` live in `orbit-core` and are exported to TypeScript together with command types.
+Events are not commands and are not audited. `orbit-core::event_catalog()` is the single source of truth for the **four host-emitted** event ids and their payload schemas; `bus::emit` rejects ids that are not registered, so a typo cannot silently produce an event no frontend listens to. `ClipboardChanged`, `RegionSelectionStart` and `RecordStateEvent` live in `orbit-core` and are exported to TypeScript together with command types. The `system-metrics` id was removed on 2026-11-11: a once-per-second sampler was emitting it while the frontend only stored the payload, so both the thread and the contract were deleted.
 
 | Event id | Payload | Emitted by |
 | --- | --- | --- |
-| `system-metrics` | `SystemMetrics` (`{ cpuUsage, cpuTemperature, gameFps }`) | background metrics sampler |
 | `clip://changed` | `ClipboardChanged` (`{ id, kind, deduplicated, count }`) | clipboard watcher |
 | `clip://shown` | `null` | clipboard window focus helper |
 | `region-selection-start` | `RegionSelectionStart` (`{ monitorId }`) | region selection command |
+| `record-state` | `RecordStateEvent` (`{ phase, path, message }`) | `record.start` / `record.stop` / recording shortcut |
 
-Audit boundary: every command invocation, including `region.*`, is written to `audit_log` with status and duration. Events are high-frequency notifications, not commands, and are deliberately **not** audited; an emission failure is logged (`log::warn`) and never fails the originating command. For example, a clipboard history write succeeds even if `clip://changed` cannot be delivered, and a metrics sample is dropped with a log line if the webview is gone.
+Audit boundary: every command invocation, including `region.*`, is written to `audit_log` with status and duration. Events are notifications, not commands, and are deliberately **not** audited; an emission failure is logged (`log::warn`) and never fails the originating command. For example, a clipboard history write succeeds even if `clip://changed` cannot be delivered. Since 2026-11-11 the log plugin is registered in release builds too (Warn level), so these warnings are no longer silently dropped in the shipped exe.
 
 Region selection semantics:
 
@@ -91,12 +104,20 @@ Region selection semantics:
 - **Cancel**: `region.cancel` is idempotent, hides the selection window and restores the main overlay; it takes no screenshot and does not touch the clipboard. Closing the window via Esc maps to the same command.
 - **Audit**: `region.start` and `region.cancel` each produce one audit row; `region.finish` produces its own row plus the nested `screenshot.capture` row, so a failed capture is attributable to the exact command that failed.
 
-## Direct IPC commands outside the bus
+### Frontend-only cross-window events
 
-As of 2026-11-10 the command bus covers all 37 commands: `screenshot.capture`, `system.info`, `system.dash`, `system.monitor`, `overlay.dock`, `overlay.set_open`, `app.setup.status`, `app.setup.complete`, `app.autostart.set`, `app.quit`, the 15 `clipboard.*` commands, the pure request-response batch `record.start`, `record.stop`, `ocr.image`, `ocr.current_screen`, `kb_record.start`, `kb_record.stop`, `convert.format`, the event-push batch `region.start`, `region.finish`, `region.cancel`, and the elevated pair `elevated.set`, `elevated.status`. The implementations live in `src-tauri/src/lib.rs` (plus `clipboard.rs`, `elevated.rs`) as plain `pub(crate)` functions.
+`region-capture-result` is the one exception to the host-event rule above: the `selection` window emits it and the `main` window listens, both via `@tauri-apps/api/event`. Rust never emits or subscribes to it, so it is deliberately **not** in `event_catalog()` and is not audited. Its payload is `{ response?: CommandResponse; error?: string; cancelled?: boolean }`; the selection window reports the outcome of `region.finish` back to the overlay. Any new event that Rust emits must still be registered in `event_catalog()`.
+
+### TypeScript numeric mapping
+
+`serde_json` serialises Rust `u64`/`i64` as JSON numbers, while `ts-rs` maps 64-bit integers to `bigint` by default. Every 64-bit field in `contract.rs` therefore carries `#[ts(type = "number")]` so the generated bindings match the wire format; `usize` and 32-bit integers already map to `number`. `App.svelte`, `ClipboardPanel.svelte` and `SystemMonitor.svelte` import the generated types instead of declaring local copies. A regression shows up immediately as a `svelte-check` error (`bigint` not assignable to `number`).
+
+## Command bus coverage (no direct IPC commands)
+
+As of 2026-11-11 the command bus covers all 39 commands: `screenshot.capture`, `system.info`, `system.dash`, `system.monitor`, `overlay.dock`, `overlay.set_open`, `overlay.layout`, `app.setup.status`, `app.setup.complete`, `app.autostart.set`, `app.quit`, the 15 `clipboard.*` commands, the pure request-response batch `record.start`, `record.stop`, `record.recovery.list`, `ocr.image`, `ocr.current_screen`, `kb_record.start`, `kb_record.stop`, `convert.format`, the event-push batch `region.start`, `region.finish`, `region.cancel`, and the elevated pair `elevated.set`, `elevated.status`. The implementations live in `src-tauri/src/lib.rs` (plus `clipboard.rs`, `elevated.rs`) as plain `pub(crate)` functions.
 
 `invoke_handler` registers exactly two IPC commands: `get_command_catalog` (read-only schema discovery) and `execute_command` (the sole execution path). The per-command `#[tauri::command]` delegates were deleted on 2026-11-10 after the frontend switched every call to `runCommand()` in `src/bus.ts`, so there is no second entry point that could bypass registry lookup, param validation, or auditing.
 
 ### Elevated helper boundaries
 
-`src-tauri/src/elevated.rs` owns the whole privileged side channel: flag file (`%TEMP%\orbit_helper_run.flag`), live sample file (`%TEMP%\orbit_helper_live.json`, considered stale after 30 s), UAC launch of `orbit-elevated-helper.exe`, and `ElevatedError` → message mapping. `elevated.set` only flips user intent and (on enable) launches the helper once; it never blocks the UI thread on UAC and never retries automatically. `elevated.status` reports `user intent || helper alive`, so a helper that dies silently degrades to `false` instead of a stale `true`. A failed launch surfaces as a typed error (`helper missing` / `flag write failed` / `launch failed`), keeps the previous intent untouched, and is audited like any other command failure; temperature reads return `null` when the live file is missing or stale, and the dashboard hides that cell rather than showing an estimate.
+`src-tauri/src/elevated.rs` owns the whole privileged side channel: flag file (`%TEMP%\orbit_helper_run.flag`), live sample file (`%TEMP%\orbit_helper_live.json`, considered stale after 30 s), UAC launch of `orbit-elevated-helper.exe`, and `ElevatedError` → message mapping. `elevated.set` only flips user intent and (on enable) launches the helper once; it never blocks the UI thread on UAC and never retries automatically. `elevated.status` reports `user intent || helper alive`: when the user has enabled the feature it stays `true` even if the helper died — the value is intent, not liveness — so the UI can offer a retry. A dead helper is still contained by the shared `LIVE_STALE` freshness constant (30 s) used by both `is_watch_running()` and `read_temperature()`: temperature reads return `null` and the dashboard hides that cell rather than showing an estimate. A failed launch surfaces as a typed error (`helper missing` / `flag write failed` / `launch failed`), keeps the previous intent untouched, and is audited like any other command failure. `helper-manifest/orbit-elevated-helper.manifest` is **not** embedded by `build.rs`; elevation happens on the launching `Start-Process -Verb RunAs` in `elevated.rs`, not via an exe manifest.

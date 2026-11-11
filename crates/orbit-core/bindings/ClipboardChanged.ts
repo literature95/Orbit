@@ -3,4 +3,4 @@
 /**
  * `clip://changed`：剪贴板历史新增或去重后的增量通知。
  */
-export type ClipboardChanged = { id: bigint, kind: string, deduplicated: boolean, count: number, };
+export type ClipboardChanged = { id: number, kind: string, deduplicated: boolean, count: number, };

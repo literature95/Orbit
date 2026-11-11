@@ -3,4 +3,4 @@
 /**
  * 系统监视器快照：总体与每核 CPU、内存、开机时长、温度。
  */
-export type MonitorSnapshot = { cpuPercent: number, perCore: Array<number>, memoryUsedPercent: number, memoryUsedMb: bigint, memoryTotalMb: bigint, uptimeSecs: bigint, temperatureC: number | null, temperatureEnabled: boolean, };
+export type MonitorSnapshot = { cpuPercent: number, perCore: Array<number>, memoryUsedPercent: number, memoryUsedMb: number, memoryTotalMb: number, uptimeSecs: number, temperatureC: number | null, temperatureEnabled: boolean, };

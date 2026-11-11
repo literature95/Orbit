@@ -3,4 +3,4 @@
 /**
  * 悬浮球所在显示器的屏幕与内存概况。
  */
-export type SystemInfo = { osName: string, osVersion: string, screenWidth: number, screenHeight: number, scaleFactor: number, totalMemoryMb: bigint, availableMemoryMb: bigint, };
+export type SystemInfo = { osName: string, osVersion: string, screenWidth: number, screenHeight: number, scaleFactor: number, totalMemoryMb: number, availableMemoryMb: number, };

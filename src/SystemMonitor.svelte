@@ -1,22 +1,12 @@
 <script lang="ts">
   import { isTauri } from '@tauri-apps/api/core';
   import { onMount, onDestroy } from 'svelte';
+  import type { MonitorSnapshot } from '../crates/orbit-core/bindings/MonitorSnapshot';
   import { runCommand } from './bus';
 
   export let onclose: () => void = () => {};
 
-  type Snapshot = {
-    cpuPercent: number;
-    perCore: number[];
-    memoryUsedPercent: number;
-    memoryUsedMb: number;
-    memoryTotalMb: number;
-    uptimeSecs: number;
-    temperatureC: number | null;
-    temperatureEnabled: boolean;
-  };
-
-  let snapshot: Snapshot | null = null;
+  let snapshot: MonitorSnapshot | null = null;
   let error = '';
   let toggling = false;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -42,7 +32,7 @@
       return;
     }
     try {
-      snapshot = await runCommand<Snapshot>('system.monitor');
+      snapshot = await runCommand<MonitorSnapshot>('system.monitor');
       error = '';
     } catch (e) {
       error = `读取系统指标失败：${String(e)}`;

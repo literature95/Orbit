@@ -3,7 +3,7 @@
 /**
  * 剪贴板历史条目：文本 / 文件列表 / 图片。
  */
-export type ClipItem = { id: bigint, 
+export type ClipItem = { id: number, 
 /**
  * text | files | image
  */
@@ -11,4 +11,4 @@ kind: string,
 /**
  * 文本内容 / 文件列表 JSON 数组 / 图片 PNG 文件的绝对路径
  */
-content: string, preview: string, hash: string, pinned: boolean, favorite: boolean, useCount: bigint, createdAt: bigint, updatedAt: bigint, };
+content: string, preview: string, hash: string, pinned: boolean, favorite: boolean, useCount: number, createdAt: number, updatedAt: number, };

@@ -13,9 +13,9 @@ use crate::{
 use orbit_core::{
     AuditLog, CommandRequest, CommandResponse, CommandSpec, CommandStatus, DashInfo, EmptyParams,
     ClipFlagParams, ClipIdParams, ClipListParams, ClipMonitorParams, ClipWriteParams,
-    ConvertFormatParams, MonitorSnapshot, OcrImageParams, OverlaySnapshot, RegionFinishParams,
-    ScreenshotRequest, SetAutostartParams, SetElevatedParams, SetOverlayOpenParams,
-    SystemInfo, command_catalog, event_catalog,
+    ConvertFormatParams, MonitorSnapshot, OcrImageParams, OverlaySnapshot, RecordStartParams,
+    RegionFinishParams, ScreenshotRequest, SetAutostartParams, SetElevatedParams,
+    SetOverlayOpenParams, SystemInfo, command_catalog, event_catalog,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -509,9 +509,9 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
             BusCommand {
                 spec: catalog_spec(&catalog, "record.start"),
                 run: sync(|ctx, params| {
-                    let _: EmptyParams =
-                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
-                    crate::record_start_impl(&ctx.app)
+                    let RecordStartParams { region } = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::record_start_impl(&ctx.app, region)
                 }),
             },
         );
@@ -527,6 +527,18 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         let path = crate::record_stop_impl(&ctx.app).await?;
                         serde_json::to_value(path).map_err(|error| error.to_string())
                     })
+                }),
+            },
+        );
+
+        map.insert(
+            "record.recovery.list",
+            BusCommand {
+                spec: catalog_spec(&catalog, "record.recovery.list"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams =
+                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::list_recovery_impl(&ctx.app)
                 }),
             },
         );
@@ -555,8 +567,8 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                             .app
                             .get_webview_window("main")
                             .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
-                        let text = crate::ocr_current_screen_impl(&window).await?;
-                        serde_json::to_value(text).map_err(|error| error.to_string())
+                        let result = crate::ocr_current_screen_impl(&window).await?;
+                        serde_json::to_value(result).map_err(|error| error.to_string())
                     })
                 }),
             },

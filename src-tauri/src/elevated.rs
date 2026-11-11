@@ -33,16 +33,23 @@ fn helper_live_path() -> PathBuf {
     std::env::temp_dir().join("orbit_helper_live.json")
 }
 
+/// helper 输出的有效期；存活判断与温度读取必须共用同一阈值。
+const LIVE_STALE: Duration = Duration::from_secs(30);
+
+fn live_is_fresh(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .map(|age| age <= LIVE_STALE)
+        .unwrap_or(false)
+}
+
 pub fn is_watch_running() -> bool {
     if !helper_flag_path().exists() {
         return false;
     }
-    std::fs::metadata(helper_live_path())
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|time| time.elapsed().ok())
-        .map(|age| age < Duration::from_secs(30))
-        .unwrap_or(false)
+    live_is_fresh(&helper_live_path())
 }
 
 /// 拉起常驻 helper；已在运行时直接返回，不重复弹 UAC。
@@ -89,14 +96,17 @@ pub fn stop_watch() {
     let _ = std::fs::remove_file(helper_flag_path());
 }
 
-/// 读取最近一次温度；文件缺失或过期（>30 秒）视为不可用。
+/// 读取最近一次温度；文件缺失或超过 `LIVE_STALE` 视为不可用。
 pub fn read_temperature() -> Option<f32> {
-    let meta = std::fs::metadata(helper_live_path()).ok()?;
-    let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > Duration::from_secs(30) {
+    read_temperature_from(&helper_live_path())
+}
+
+/// 路径可注入，便于单测在不依赖真实 helper 的前提下验证解析与过期行为。
+fn read_temperature_from(path: &std::path::Path) -> Option<f32> {
+    if !live_is_fresh(path) {
         return None;
     }
-    let raw = std::fs::read_to_string(helper_live_path()).ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("temperature_c")?
@@ -115,9 +125,39 @@ mod tests {
         assert!(error.message().starts_with("helper 不存在"));
     }
 
+    fn temp_live_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit-elevated-test-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        dir.join("live.json")
+    }
+
     #[test]
     fn temperature_is_none_without_live_file() {
-        // 环境里若恰好有真实 helper 在跑，本用例可能返回 Some，不做强断言。
-        let _ = read_temperature();
+        let path = temp_live_path("missing");
+        assert_eq!(read_temperature_from(&path), None, "缺少 live 文件应返回 None");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn temperature_reads_fresh_live_file_and_rejects_bad_payload() {
+        let path = temp_live_path("fresh");
+        std::fs::write(&path, r#"{"temperature_c": 42.5}"#).unwrap();
+        assert_eq!(read_temperature_from(&path), Some(42.5));
+        std::fs::write(&path, r#"{"temperature_c": "bad"}"#).unwrap();
+        assert_eq!(read_temperature_from(&path), None, "非数值温度应返回 None");
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(read_temperature_from(&path), None, "非法 JSON 应返回 None");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stale_threshold_is_shared_by_watch_and_read() {
+        assert_eq!(LIVE_STALE, Duration::from_secs(30));
     }
 }

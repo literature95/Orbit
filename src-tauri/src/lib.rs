@@ -1,10 +1,11 @@
 use orbit_core::{
-    AuditLog, CommandRequest, CommandResponse, CommandStatus, DockPosition, PermissionState,
-    RegionFinishParams, RegionSelectionStart, SetupResult, SystemMetrics, WindowLayout, WindowSize,
+    AuditLog, CaptureRegion, CommandRequest, CommandResponse, CommandStatus, DockPosition,
+    OcrResult, PermissionState, RecordStateEvent, RecoveryItem, RegionFinishParams,
+    RegionSelectionStart, SetupResult, WindowLayout, WindowSize,
 };
 use std::sync::Mutex;
 use std::time::Instant;
-use sysinfo::{Components, System};
+use sysinfo::System;
 use tauri::Manager;
 use tauri::{
     AppHandle, PhysicalPosition, PhysicalSize, WebviewWindow, WindowEvent,
@@ -28,6 +29,16 @@ const EXPANDED_SIZE: WindowSize = WindowSize { width: 340.0, height: 340.0 };
 const PANEL_INSET: f64 = 0.0;
 /// 贴近屏幕边缘多少像素内才吸附，避免大老远就触发停靠
 const EDGE_THRESHOLD: i32 = 24;
+
+/// 日志后端在 debug / release 都必须存在：release 只保留 Warn 以上，
+/// 避免录屏状态、快捷键注册等失败在正式包里被静默吞掉。
+fn log_level(debug_build: bool) -> log::LevelFilter {
+    if debug_build {
+        log::LevelFilter::Info
+    } else {
+        log::LevelFilter::Warn
+    }
+}
 
 /// 窗口尺寸的唯一发布点：初始尺寸读取 tauri.conf.json，状态尺寸取上面的常量。
 /// 找不到配置窗口时直接报错，不在代码里再抄一份兜底数字。
@@ -415,7 +426,97 @@ fn set_overlay_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::{DockPosition, determine_dock_position};
+    use super::{
+        DockPosition, ResolvedRegion, determine_dock_position, ffmpeg_record_args,
+        list_recovery_items, parse_ocr_output, register_recovery_item,
+    };
+
+    #[test]
+    fn release_build_keeps_a_log_backend() {
+        assert_eq!(super::log_level(true), log::LevelFilter::Info);
+        assert_eq!(super::log_level(false), log::LevelFilter::Warn);
+        assert_ne!(super::log_level(false), log::LevelFilter::Off);
+    }
+
+    #[test]
+    fn ffmpeg_record_args_support_optional_region() {
+        let full = ffmpeg_record_args("out.mp4", None);
+        assert!(!full.iter().any(|arg| arg == "-offset_x"));
+        assert!(full.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "gdigrab"));
+        let region = ResolvedRegion {
+            abs_x: 120,
+            abs_y: 80,
+            width: 320,
+            height: 240,
+        };
+        let args = ffmpeg_record_args("out.mp4", Some(&region));
+        let flag = |name: &str| -> String {
+            let index = args
+                .iter()
+                .position(|arg| arg == name)
+                .unwrap_or_else(|| panic!("缺少 {name} 参数"));
+            args[index + 1].clone()
+        };
+        assert_eq!(flag("-offset_x"), "120");
+        assert_eq!(flag("-offset_y"), "80");
+        assert_eq!(flag("-video_size"), "320x240");
+        assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    #[test]
+    fn recovery_manifest_round_trips_items() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit-recovery-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let item = orbit_core::RecoveryItem {
+            path: "recovered.mp4".to_string(),
+            reason: "ffmpeg 收尾超时".to_string(),
+            created_at: "2026-11-11T00:00:00Z".to_string(),
+            size_bytes: 42,
+        };
+        assert!(list_recovery_items(&dir).unwrap().is_empty());
+        register_recovery_item(&dir, item.clone()).unwrap();
+        register_recovery_item(&dir, item.clone()).unwrap();
+        let items = list_recovery_items(&dir).unwrap();
+        assert_eq!(items, vec![item.clone(), item]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_ocr_output_reads_structured_json() {
+        let stdout = br#"{"text":"ORBIT 123","lines":[{"text":"ORBIT","bbox":[10,20,60,45],"words":[{"text":"ORBIT","bbox":[10,20,60,45]}]}],"textAngle":null}"#;
+        let result = parse_ocr_output(stdout).expect("解析失败");
+        assert_eq!(result.text, "ORBIT 123");
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].bbox, [10.0, 20.0, 60.0, 45.0]);
+        assert_eq!(result.lines[0].words[0].text, "ORBIT");
+        assert_eq!(result.text_angle, None);
+    }
+
+    #[test]
+    fn parse_ocr_output_rejects_plain_text_and_empty_output() {
+        assert!(parse_ocr_output(b"ORBIT 123").is_err());
+        assert!(parse_ocr_output(b"").is_err());
+    }
+
+    #[test]
+    fn parse_ocr_output_keeps_utf8_and_angle() {
+        let stdout = r#"{"text":"中文识别","lines":[],"textAngle":1.5}"#.as_bytes();
+        let result = parse_ocr_output(stdout).expect("解析失败");
+        assert_eq!(result.text, "中文识别");
+        assert_eq!(result.text_angle, Some(1.5));
+    }
+
+    #[test]
+    fn parse_ocr_output_tolerates_utf8_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"{"text":"ORBIT","lines":[],"textAngle":null}"#);
+        assert_eq!(parse_ocr_output(&bytes).unwrap().text, "ORBIT");
+    }
 
     #[test]
     fn overlay_size_follows_layout_states() {
@@ -591,12 +692,152 @@ struct RecordHandle {
     stdin: Option<std::process::ChildStdin>,
 }
 
-pub(crate) fn record_start_impl(app: &AppHandle) -> Result<String, String> {
+/// 录屏区域经显示器 origin 换算后的 gdigrab 虚拟桌面绝对坐标。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedRegion {
+    abs_x: i32,
+    abs_y: i32,
+    width: u32,
+    height: u32,
+}
+
+/// monitorId 来自 xcap（与区域截图同一来源），x/y 为该显示器内的物理像素。
+fn resolve_record_region(region: &CaptureRegion) -> Result<ResolvedRegion, String> {
+    if region.width == 0 || region.height == 0 {
+        return Err("录屏区域的宽高必须大于 0。".to_string());
+    }
+    let monitors = Monitor::all().map_err(|error| error.to_string())?;
+    let mut origin = None;
+    for candidate in &monitors {
+        if candidate.id().map_err(|error| error.to_string())? == region.monitor_id {
+            origin = Some((
+                candidate.x().map_err(|error| error.to_string())?,
+                candidate.y().map_err(|error| error.to_string())?,
+            ));
+            break;
+        }
+    }
+    let (origin_x, origin_y) =
+        origin.ok_or_else(|| format!("录屏区域引用了不存在的显示器 {}", region.monitor_id))?;
+    Ok(ResolvedRegion {
+        abs_x: origin_x.saturating_add(i32::try_from(region.x).unwrap_or(i32::MAX)),
+        abs_y: origin_y.saturating_add(i32::try_from(region.y).unwrap_or(i32::MAX)),
+        width: region.width,
+        height: region.height,
+    })
+}
+
+/// 构造 gdigrab 参数：与显示器枚举解耦，便于单测。
+/// 区域录制时在 `-i desktop` 前插入 offset_x / offset_y / video_size。
+fn ffmpeg_record_args(path_str: &str, region: Option<&ResolvedRegion>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-f".into(),
+        "gdigrab".into(),
+        "-framerate".into(),
+        "30".into(),
+        "-draw_mouse".into(),
+        "1".into(),
+    ];
+    if let Some(region) = region {
+        args.extend([
+            "-offset_x".into(),
+            region.abs_x.to_string(),
+            "-offset_y".into(),
+            region.abs_y.to_string(),
+            "-video_size".into(),
+            format!("{}x{}", region.width, region.height),
+        ]);
+    }
+    args.extend([
+        "-i".into(),
+        "desktop".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-b:v".into(),
+        "4M".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        path_str.into(),
+    ]);
+    args
+}
+
+/// 恢复区：收尾被强杀时保留可能不完整的 MP4，避免素材直接丢失。
+fn recovery_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("record-recovery"))
+}
+
+fn recovery_manifest(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("recovery.json")
+}
+
+fn register_recovery_item(dir: &std::path::Path, item: RecoveryItem) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let manifest = recovery_manifest(dir);
+    let mut items: Vec<RecoveryItem> = if manifest.exists() {
+        let raw = std::fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    items.push(item);
+    let staged = dir.join("recovery.json.tmp");
+    let payload = serde_json::to_string_pretty(&items).map_err(|error| error.to_string())?;
+    std::fs::write(&staged, payload).map_err(|error| error.to_string())?;
+    std::fs::rename(&staged, &manifest).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn list_recovery_items(dir: &std::path::Path) -> Result<Vec<RecoveryItem>, String> {
+    let manifest = recovery_manifest(dir);
+    if !manifest.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+pub(crate) fn list_recovery_impl(app: &AppHandle) -> Result<Vec<RecoveryItem>, String> {
+    list_recovery_items(&recovery_dir(app)?)
+}
+
+/// gdigrab 捕获屏幕像素，无法像 WGC 那样排除自身窗口；录制期间隐藏悬浮球。
+fn set_main_visible(app: &AppHandle, visible: bool) {
+    if let Some(window) = app.get_webview_window("main") {
+        let result = if visible { window.show() } else { window.hide() };
+        if let Err(error) = result {
+            log::warn!("切换悬浮球可见性失败：{error}");
+        }
+    }
+}
+
+fn emit_record_state(app: &AppHandle, phase: &str, path: Option<String>, message: Option<String>) {
+    let event = RecordStateEvent {
+        phase: phase.to_string(),
+        path,
+        message,
+    };
+    if let Err(error) = bus::emit(app, "record-state", &event) {
+        log::warn!("录屏状态事件发送失败：{error}");
+    }
+}
+
+pub(crate) fn record_start_impl(
+    app: &AppHandle,
+    region: Option<CaptureRegion>,
+) -> Result<String, String> {
     if app.state::<RecordState>().0.lock().unwrap().is_some() {
         return Err("已经在录制中".to_string());
     }
-    // 找 FFmpeg（sidecar 或 PATH）
     let ffmpeg = resolve_ffmpeg(app);
+    let resolved = region.as_ref().map(resolve_record_region).transpose()?;
 
     // 生成输出路径：桌面/Orbit/orbit_rec_*.mp4
     let home = std::env::var("USERPROFILE")
@@ -612,30 +853,20 @@ pub(crate) fn record_start_impl(app: &AppHandle) -> Result<String, String> {
     );
     let path = dir.join(&filename);
     let path_str = path.to_string_lossy().to_string();
-    let handle = spawn_ffmpeg_recording(&ffmpeg, &path_str)?;
+    let handle = spawn_ffmpeg_recording(&ffmpeg, &path_str, resolved.as_ref())?;
     *app.state::<RecordState>().0.lock().unwrap() = Some(handle);
+    set_main_visible(app, false);
+    emit_record_state(app, "started", Some(path_str.clone()), None);
     Ok(path_str)
 }
 
-/// 启动 FFmpeg gdigrab 全屏录制，返回句柄；与测试共用。
+/// 启动 FFmpeg gdigrab 录制，返回句柄；与测试共用。
 fn spawn_ffmpeg_recording(
     ffmpeg: &std::path::Path,
     path_str: &str,
+    region: Option<&ResolvedRegion>,
 ) -> Result<RecordHandle, String> {
-    // FFmpeg gdigrab 全屏录制，H264 编码，4Mbps
-    let args = [
-        "-y",
-        "-f", "gdigrab",
-        "-framerate", "30",
-        "-draw_mouse", "1",
-        "-i", "desktop",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-b:v", "4M",
-        "-pix_fmt", "yuv420p",
-        path_str,
-    ];
-
+    let args = ffmpeg_record_args(path_str, region);
     let mut child = std::process::Command::new(ffmpeg)
         .no_window()
         .args(&args)
@@ -658,8 +889,17 @@ fn spawn_ffmpeg_recording(
     })
 }
 
+struct RecordOutcome {
+    path: String,
+    recovered: bool,
+}
+
 /// 正常收尾：向 stdin 写 q 让 FFmpeg 写完 mp4 尾部，超时才强杀。
-fn finish_recording(handle: RecordHandle) -> Result<Option<String>, String> {
+/// 强杀意味着尾部可能不完整，此时把文件移入恢复区并登记 manifest。
+fn finish_recording(
+    handle: RecordHandle,
+    recovery_dir: &std::path::Path,
+) -> Result<RecordOutcome, String> {
     use std::io::Write;
     let mut handle = handle;
     if let Some(mut stdin) = handle.stdin.take() {
@@ -667,14 +907,15 @@ fn finish_recording(handle: RecordHandle) -> Result<Option<String>, String> {
         let _ = stdin.flush();
     }
     let deadline = Instant::now() + std::time::Duration::from_secs(8);
+    let mut forced_kill = false;
     loop {
         match handle.child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // 兜底：FFmpeg 无响应时才强杀（此时尾部可能不完整）。
                     let _ = handle.child.kill();
                     let _ = handle.child.wait();
+                    forced_kill = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -682,7 +923,39 @@ fn finish_recording(handle: RecordHandle) -> Result<Option<String>, String> {
             Err(_) => break,
         }
     }
-    Ok(Some(handle.path))
+    if forced_kill {
+        let source = std::path::Path::new(&handle.path);
+        if source.exists() {
+            let name = source
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "orbit_rec_recovered.mp4".to_string());
+            std::fs::create_dir_all(recovery_dir).map_err(|error| error.to_string())?;
+            let dest = recovery_dir.join(&name);
+            let moved = std::fs::rename(source, &dest).is_ok()
+                || (std::fs::copy(source, &dest).is_ok() && std::fs::remove_file(source).is_ok());
+            if moved {
+                let item = RecoveryItem {
+                    path: dest.to_string_lossy().to_string(),
+                    reason: "FFmpeg 收尾超时，MP4 尾部可能不完整".to_string(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs().to_string())
+                        .unwrap_or_default(),
+                    size_bytes: std::fs::metadata(&dest).map(|meta| meta.len()).unwrap_or(0),
+                };
+                register_recovery_item(recovery_dir, item)?;
+                return Ok(RecordOutcome {
+                    path: dest.to_string_lossy().to_string(),
+                    recovered: true,
+                });
+            }
+        }
+    }
+    Ok(RecordOutcome {
+        path: handle.path,
+        recovered: false,
+    })
 }
 
 pub(crate) async fn record_stop_impl(app: &AppHandle) -> Result<Option<String>, String> {
@@ -694,9 +967,32 @@ pub(crate) async fn record_stop_impl(app: &AppHandle) -> Result<Option<String>, 
         .take()
         .ok_or_else(|| "没有正在录制的会话".to_string())?;
 
-    tauri::async_runtime::spawn_blocking(move || finish_recording(handle))
+    emit_record_state(app, "saving", None, None);
+    let dir = recovery_dir(app)
+        .unwrap_or_else(|_| std::env::temp_dir().join("orbit-record-recovery"));
+    let outcome = tauri::async_runtime::spawn_blocking(move || finish_recording(handle, &dir))
         .await
-        .map_err(|error| format!("录屏停止线程异常退出：{error}"))?
+        .map_err(|error| format!("录屏停止线程异常退出：{error}"))?;
+    set_main_visible(app, true);
+    match outcome {
+        Ok(outcome) => {
+            if outcome.recovered {
+                emit_record_state(
+                    app,
+                    "recovering",
+                    Some(outcome.path.clone()),
+                    Some("录屏收尾超时，文件已移入恢复区".to_string()),
+                );
+            } else {
+                emit_record_state(app, "saved", Some(outcome.path.clone()), None);
+            }
+            Ok(Some(outcome.path))
+        }
+        Err(error) => {
+            emit_record_state(app, "recovering", None, Some(error.clone()));
+            Err(error)
+        }
+    }
 }
 
 // ============ OCR ============
@@ -722,13 +1018,27 @@ fn current_capture_monitor(window: &WebviewWindow) -> Result<Monitor, String> {
         .ok_or_else(|| "无法将窗口显示器映射到截图设备。".to_string())
 }
 
-pub(crate) fn ocr_image_blocking(image_path: &str) -> Result<String, String> {
+/// PowerShell 输出统一在这里解析：UTF-8、BOM、空输出与非 JSON 都要给出明确错误。
+fn parse_ocr_output(stdout: &[u8]) -> Result<OcrResult, String> {
+    let raw = String::from_utf8(stdout.to_vec())
+        .map_err(|error| format!("OCR 输出不是 UTF-8：{error}"))?;
+    let payload = raw.trim_start_matches('\u{feff}').trim();
+    if payload.is_empty() {
+        return Err("OCR 未返回任何内容。".to_string());
+    }
+    serde_json::from_str(payload).map_err(|error| format!("OCR 结果解析失败：{error}"))
+}
+
+pub(crate) fn ocr_image_blocking(image_path: &str) -> Result<OcrResult, String> {
     // Windows.Media.Ocr 通过 PowerShell 调用（Windows 10+ 内置）。
     // 路径经环境变量传入，不做字符串内插，避免引号破坏脚本或注入。
     // Await 用反射调用泛型 AsTask：PowerShell 直接调用时无法对 __ComObject
     // 解析泛型重载（MethodCountCouldNotFindBest），必须显式指定结果类型。
+    // 输出结构化 JSON：text + lines/words + bbox([x1,y1,x2,y2])，
+    // bbox 语义与 LiteParse OCR HTTP 契约一致；坐标来自 WinRT 的 BoundingRect。
     let ps_script = r#"
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
 $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]
@@ -746,6 +1056,14 @@ function Await($op, $resultType) {
   $task.Wait() | Out-Null
   return $task.Result
 }
+function ToBBox($rect) {
+  return @(
+    [double]$rect.X,
+    [double]$rect.Y,
+    [double]($rect.X + $rect.Width),
+    [double]($rect.Y + $rect.Height)
+  )
+}
 
 $path = $env:ORBIT_OCR_PATH
 $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
@@ -754,7 +1072,38 @@ $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) (
 $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-$result.Text
+
+$lines = @()
+foreach ($line in $result.Lines) {
+  $words = @()
+  $x1 = [double]::PositiveInfinity
+  $y1 = [double]::PositiveInfinity
+  $x2 = [double]::NegativeInfinity
+  $y2 = [double]::NegativeInfinity
+  foreach ($word in $line.Words) {
+    $box = ToBBox $word.BoundingRect
+    $words += [ordered]@{ text = [string]$word.Text; bbox = @($box) }
+    if ($box[0] -lt $x1) { $x1 = $box[0] }
+    if ($box[1] -lt $y1) { $y1 = $box[1] }
+    if ($box[2] -gt $x2) { $x2 = $box[2] }
+    if ($box[3] -gt $y2) { $y2 = $box[3] }
+  }
+  if ($words.Count -eq 0) { $x1 = 0; $y1 = 0; $x2 = 0; $y2 = 0 }
+  $lines += [ordered]@{
+    text = [string]$line.Text
+    bbox = @($x1, $y1, $x2, $y2)
+    words = @($words)
+  }
+}
+
+$angle = $null
+try { if ($null -ne $result.TextAngle) { $angle = [double]$result.TextAngle } } catch { $angle = $null }
+$payload = [ordered]@{
+  text = [string]$result.Text
+  lines = @($lines)
+  textAngle = $angle
+}
+ConvertTo-Json -InputObject $payload -Compress -Depth 8
 "#;
 
     let output = std::process::Command::new("powershell.exe")
@@ -765,14 +1114,14 @@ $result.Text
         .map_err(|e| format!("PowerShell 启动失败：{}", e))?;
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        parse_ocr_output(&output.stdout)
     } else {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
         Err(format!("OCR 失败：{}", err))
     }
 }
 
-pub(crate) async fn ocr_current_screen_impl(window: &WebviewWindow) -> Result<String, String> {
+pub(crate) async fn ocr_current_screen_impl(window: &WebviewWindow) -> Result<OcrResult, String> {
     let window = window.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // 截取悬浮球当前所在显示器（多显示器环境下不再固定截第一块）。
@@ -1025,7 +1374,25 @@ pub fn run() {
                         if let Err(error) = handle.global_shortcut().on_shortcut(
                             clipboard::CLIP_SHORTCUT,
                             |app, _shortcut, event| {
-                                if event.state == ShortcutState::Pressed {
+                                if event.state != ShortcutState::Pressed {
+                                    return;
+                                }
+                                // 录制期间悬浮球被隐藏，Alt+V 临时承担停止入口；
+                                // 与 Kiri 一样只在录制状态下改变快捷键语义。
+                                let is_recording = app
+                                    .state::<RecordState>()
+                                    .0
+                                    .lock()
+                                    .map(|guard| guard.is_some())
+                                    .unwrap_or(false);
+                                if is_recording {
+                                    let handle = app.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        if let Err(error) = record_stop_impl(&handle).await {
+                                            log::warn!("快捷键停止录屏失败：{error}");
+                                        }
+                                    });
+                                } else {
                                     clipboard::toggle_clipboard_window(app);
                                 }
                             },
@@ -1039,39 +1406,6 @@ pub fn run() {
                     .map_err(|error| format!("快捷键注册线程启动失败：{error}"))?;
             }
 
-            let app_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let mut system = System::new();
-                let mut components = Components::new();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    system.refresh_cpu_usage();
-                    components.refresh(false);
-                    let cpu_temperature = components
-                        .iter()
-                        .filter(|component| {
-                            let label = component.label().to_ascii_lowercase();
-                            label.contains("cpu")
-                                || label.contains("package")
-                                || label.contains("tctl")
-                                || label.contains("tdie")
-                        })
-                        .filter_map(|component| component.temperature())
-                        .max_by(f32::total_cmp);
-                    if let Err(error) = bus::emit(
-                        &app_handle,
-                        "system-metrics",
-                        &SystemMetrics {
-                            cpu_usage: system.global_cpu_usage(),
-                            cpu_temperature,
-                            game_fps: None,
-                        },
-                    ) {
-                        log::warn!("Failed to emit system metrics: {error}");
-                    }
-                }
-            });
-
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
                 if let Err(error) = disable_window_transitions(&window) {
@@ -1079,13 +1413,11 @@ pub fn run() {
                 }
             }
 
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log_level(cfg!(debug_assertions)))
+                    .build(),
+            )?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -1135,21 +1467,98 @@ mod smoke {
         dir.join(name)
     }
 
+    fn ffprobe_available() -> bool {
+        std::process::Command::new("ffprobe")
+            .arg("-version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// 用 ffprobe 反读产物，验证 mp4 尾部完整且视频流元数据可读。
+    fn ffprobe_video_metadata(path: &std::path::Path) -> serde_json::Value {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height:format=duration",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .expect("启动 ffprobe 失败");
+        assert!(
+            output.status.success(),
+            "ffprobe 无法读取录屏文件：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe 输出不是合法 JSON")
+    }
+
+    fn record_and_probe(
+        path: &std::path::Path,
+        region: Option<ResolvedRegion>,
+    ) -> serde_json::Value {
+        let path_str = path.to_string_lossy().to_string();
+        let recovery = temp_path("record-recovery-smoke");
+        let handle =
+            spawn_ffmpeg_recording(std::path::Path::new("ffmpeg"), &path_str, region.as_ref())
+                .expect("启动录制失败");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let outcome = finish_recording(handle, &recovery).expect("停止录制失败");
+        assert_eq!(outcome.path, path_str);
+        assert!(!outcome.recovered, "正常收尾不应进入恢复区");
+        assert!(
+            std::fs::metadata(path).expect("录制文件不存在").len() > 0,
+            "录制文件为空"
+        );
+        ffprobe_video_metadata(path)
+    }
+
     #[test]
-    fn record_start_stop_produces_video() {
-        if !ffmpeg_available() {
-            eprintln!("跳过：未找到 ffmpeg");
+    fn record_start_stop_produces_probeable_video() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("跳过：未找到 ffmpeg / ffprobe");
             return;
         }
         let path = temp_path("record-smoke.mp4");
-        let path_str = path.to_string_lossy().to_string();
-        let handle = spawn_ffmpeg_recording(std::path::Path::new("ffmpeg"), &path_str)
-            .expect("启动录制失败");
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let stopped = finish_recording(handle).expect("停止录制失败");
-        assert_eq!(stopped.as_deref(), Some(path_str.as_str()));
-        let size = std::fs::metadata(&path).expect("录制文件不存在").len();
-        assert!(size > 0, "录制文件为空");
+        let meta = record_and_probe(&path, None);
+        let stream = &meta["streams"][0];
+        assert_eq!(stream["codec_name"].as_str(), Some("h264"));
+        assert!(
+            stream["width"].as_u64().unwrap_or(0) > 0,
+            "ffprobe 缺少视频宽度：{meta}"
+        );
+        assert!(
+            meta["format"]["duration"].as_str().is_some(),
+            "ffprobe 缺少时长，mp4 尾部可能不完整：{meta}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_region_video_keeps_requested_dimensions() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("跳过：未找到 ffmpeg / ffprobe");
+            return;
+        }
+        let monitors = Monitor::all().expect("枚举显示器失败");
+        let monitor = monitors.first().expect("没有可用显示器");
+        let region = ResolvedRegion {
+            abs_x: monitor.x().unwrap_or(0),
+            abs_y: monitor.y().unwrap_or(0),
+            width: 320,
+            height: 240,
+        };
+        let path = temp_path("record-region-smoke.mp4");
+        let meta = record_and_probe(&path, Some(region));
+        let stream = &meta["streams"][0];
+        assert_eq!(stream["width"].as_u64(), Some(320));
+        assert_eq!(stream["height"].as_u64(), Some(240));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1176,11 +1585,25 @@ $bmp.Save($env:ORBIT_SMOKE_PNG, [System.Drawing.Imaging.ImageFormat]::Png)
     #[test]
     fn ocr_image_reads_synthetic_text() {
         let path = create_text_png("ocr-smoke.png");
-        let text = ocr_image_blocking(&path.to_string_lossy()).expect("OCR 失败");
+        let result = ocr_image_blocking(&path.to_string_lossy()).expect("OCR 失败");
         let _ = std::fs::remove_file(&path);
         assert!(
-            text.to_uppercase().contains("ORBIT"),
-            "OCR 未识别出测试文字：{text:?}"
+            result.text.to_uppercase().contains("ORBIT"),
+            "OCR 未识别出测试文字：{:?}",
+            result.text
+        );
+        assert!(!result.lines.is_empty(), "OCR 结果缺少行信息");
+        let words: Vec<_> = result
+            .lines
+            .iter()
+            .flat_map(|line| line.words.iter())
+            .collect();
+        assert!(!words.is_empty(), "OCR 结果缺少词级 bbox");
+        assert!(
+            words
+                .iter()
+                .all(|word| word.bbox[2] > word.bbox[0] && word.bbox[3] > word.bbox[1]),
+            "词级 bbox 不是有效矩形"
         );
     }
 
@@ -1190,10 +1613,10 @@ $bmp.Save($env:ORBIT_SMOKE_PNG, [System.Drawing.Imaging.ImageFormat]::Png)
         let image = monitor.capture_image().expect("截取屏幕失败");
         let path = temp_path("ocr-screen-smoke.png");
         image.save(&path).expect("保存截图失败");
-        let text = ocr_image_blocking(&path.to_string_lossy()).expect("屏幕 OCR 失败");
+        let result = ocr_image_blocking(&path.to_string_lossy()).expect("屏幕 OCR 失败");
         let _ = std::fs::remove_file(&path);
-        // 屏幕内容不可控，只要求整条链路可执行并返回文本。
-        assert!(text.len() < 1_000_000);
+        // 屏幕内容不可控，只要求整条链路可执行并返回结构化结果。
+        assert!(result.text.len() < 1_000_000);
     }
 
     #[test]

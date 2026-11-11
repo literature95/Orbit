@@ -3,4 +3,4 @@
 /**
  * 键鼠录制事件：时间戳 + 类型 + 对应键位/坐标/按钮。
  */
-export type KbEvent = { timestamp: bigint, kind: string, key: string | null, x: number | null, y: number | null, button: string | null, direction: string | null, };
+export type KbEvent = { timestamp: number, kind: string, key: string | null, x: number | null, y: number | null, button: string | null, direction: string | null, };

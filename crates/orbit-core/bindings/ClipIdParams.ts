@@ -3,4 +3,4 @@
 /**
  * 按 id 定位历史条目。
  */
-export type ClipIdParams = { id: bigint, };
+export type ClipIdParams = { id: number, };

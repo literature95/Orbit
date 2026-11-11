@@ -76,9 +76,6 @@
         "languages": ["SimpChinese"],
         "displayLanguageSelector": false
       }
-    },
-    "android": {
-      "debugApplicationIdSuffix": ".debug"
     }
   }
 }
