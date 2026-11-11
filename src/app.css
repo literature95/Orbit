@@ -192,6 +192,49 @@ button:focus-visible { outline: 3px solid var(--accent-violet); outline-offset: 
 .app-shell.top-docked { width: var(--orb-notch-w); height: var(--orb-notch-h); }
 .app-shell.expanded { position: relative; width: var(--orb-expanded-w); height: var(--orb-expanded-h); overflow: visible; }
 
+/* 录制控制条：悬浮球在录制态变为计时器 + 暂停/停止按钮 */
+.rec-control {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+.rec-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: #ff5b5b;
+  text-shadow: 0 1px 4px rgba(0,0,0,.6);
+}
+.rec-buttons { display: flex; gap: 12px; }
+.rec-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255,255,255,.16);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s ease;
+}
+.rec-btn:hover { background: rgba(255,255,255,.3); }
+.rec-btn.stop { background: rgba(255,91,91,.9); }
+.rec-btn.stop:hover { background: #ff5b5b; }
+
 .orb-button {
   position: absolute;
   left: 50%;

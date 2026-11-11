@@ -509,9 +509,33 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
             BusCommand {
                 spec: catalog_spec(&catalog, "record.start"),
                 run: sync(|ctx, params| {
-                    let RecordStartParams { region } = serde_json::from_value(params)
+                    let RecordStartParams { region, output_dir } = serde_json::from_value(params)
                         .map_err(|error| format!("参数不合法：{error}"))?;
-                    crate::record_start_impl(&ctx.app, region)
+                    crate::record_start_impl(&ctx.app, region, output_dir)
+                }),
+            },
+        );
+
+        map.insert(
+            "record.pause",
+            BusCommand {
+                spec: catalog_spec(&catalog, "record.pause"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams =
+                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::record_pause_impl(&ctx.app)
+                }),
+            },
+        );
+
+        map.insert(
+            "record.resume",
+            BusCommand {
+                spec: catalog_spec(&catalog, "record.resume"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams =
+                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::record_resume_impl(&ctx.app)
                 }),
             },
         );

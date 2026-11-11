@@ -223,16 +223,18 @@ pub struct CaptureRegion {
     pub height: u32,
 }
 
-/// 开始录制参数；region 缺省表示录制整块桌面。
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
+/// 开始录制参数；region 缺省表示录制整块桌面，output_dir 缺省为「桌面/Orbit」。
+/// 暂停采用分段录制：每段独立时间戳，停止时拼接成单个 MP4，使暂停期间不计入时间轴。
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct RecordStartParams {
     pub region: Option<CaptureRegion>,
+    pub output_dir: Option<String>,
 }
 
-/// 录屏状态变化：phase ∈ started / saving / saved / recovering。
+/// 录屏状态变化：phase ∈ started / saving / saved / recovering；paused 表示当前处于暂停态。
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -240,6 +242,7 @@ pub struct RecordStateEvent {
     pub phase: String,
     pub path: Option<String>,
     pub message: Option<String>,
+    pub paused: bool,
 }
 
 /// 录制收尾失败后保留的可恢复文件。
@@ -783,6 +786,24 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             idempotent: false,
         },
         CommandSpec {
+            id: "record.pause",
+            label: "暂停屏幕录制",
+            category: CommandCategory::Capture,
+            risk: RiskLevel::Mutating,
+            params_schema: empty_params.clone(),
+            returns_schema: null_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "record.resume",
+            label: "继续屏幕录制",
+            category: CommandCategory::Capture,
+            risk: RiskLevel::Mutating,
+            params_schema: empty_params.clone(),
+            returns_schema: null_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
             id: "record.stop",
             label: "停止屏幕录制",
             category: CommandCategory::Capture,
@@ -931,6 +952,8 @@ mod tests {
                 "clipboard.open_window",
                 "clipboard.close_window",
                 "record.start",
+                "record.pause",
+                "record.resume",
                 "record.stop",
                 "record.recovery.list",
                 "ocr.image",
@@ -972,7 +995,7 @@ mod tests {
     #[test]
     fn recording_contracts_cover_region_events_and_recovery() {
         let catalog = command_catalog().unwrap();
-        assert_eq!(catalog.len(), 39, "命令目录应包含恢复区清单命令");
+        assert_eq!(catalog.len(), 41, "命令目录应包含 pause/resume 与恢复区清单命令");
         let start = catalog
             .iter()
             .find(|spec| spec.id == "record.start")

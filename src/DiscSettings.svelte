@@ -3,7 +3,10 @@
   export let setupRunning = false;
   export let notice = '';
   export let layoutCount = 0;
+  export let recordDir: string | null = null;
   export let onedit: () => void = () => {};
+  export let onpickrecorddir: () => void = () => {};
+  export let onclearrecorddir: () => void = () => {};
   export let ontoggleautostart: () => void = () => {};
   export let onquit: () => void = () => {};
   export let onclose: () => void = () => {};
@@ -31,6 +34,15 @@
       <span class="settings-row-label">调整轮盘布局</span>
       <span class="settings-entry-value">{layoutCount} 项 ›</span>
     </button>
+
+    <div class="settings-row settings-row-multiline">
+      <span class="settings-row-label">录屏保存目录</span>
+      <span class="settings-row-value rec-dir" title={recordDir ?? ''}>{recordDir ?? '默认：桌面/Orbit'}</span>
+    </div>
+    <div class="settings-row rec-dir-actions">
+      <button class="settings-btn small" type="button" onclick={onpickrecorddir}>选择</button>
+      {#if recordDir}<button class="settings-btn small" type="button" onclick={onclearrecorddir}>清除</button>{/if}
+    </div>
 
     {#if notice}<p class="settings-notice" role="status">{notice}</p>{/if}
     <p class="settings-tip">调整页中拖动扇区排序，拖到中心或拖出圆盘移除，拖动顶部两个圆点调整内圆与外圈大小，点击中心球加回功能。</p>

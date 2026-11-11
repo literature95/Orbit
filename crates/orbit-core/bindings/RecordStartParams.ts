@@ -2,6 +2,7 @@
 import type { CaptureRegion } from "./CaptureRegion";
 
 /**
- * 开始录制参数；region 缺省表示录制整块桌面。
+ * 开始录制参数；region 缺省表示录制整块桌面，output_dir 缺省为「桌面/Orbit」。
+ * 暂停采用分段录制：每段独立时间戳，停止时拼接成单个 MP4，使暂停期间不计入时间轴。
  */
-export type RecordStartParams = { region: CaptureRegion | null, };
+export type RecordStartParams = { region: CaptureRegion | null, outputDir: string | null, };

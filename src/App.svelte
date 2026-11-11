@@ -15,6 +15,7 @@
   import type { WindowLayout } from '../crates/orbit-core/bindings/WindowLayout';
   import type { WindowSize } from '../crates/orbit-core/bindings/WindowSize';
   import { runCommand } from './bus';
+  import { open } from '@tauri-apps/plugin-dialog';
   import ClipboardPanel from './ClipboardPanel.svelte';
   import DiscSettings from './DiscSettings.svelte';
   import SystemMonitor from './SystemMonitor.svelte';
@@ -235,23 +236,66 @@
     applyTheme(THEMES[(idx + 1) % THEMES.length]);
   }
 
-  // ============ 系统监控 ============
-  // 录制期间悬浮球被隐藏，Alt+V 由 Rust 侧直接停止；状态只能靠事件回流保持一致。
+  // ============ 录屏控制 ============
+  // 录制期间悬浮球显示计时与控制按钮，暂停/停止由前端按钮触发；
+  // 是否录制、是否暂停只能靠 record-state 事件回流保持一致。
+  const RECORD_DIR_KEY = 'orbit.record.dir';
+  let recordDir: string | null = localStorage.getItem(RECORD_DIR_KEY);
+  let recordingActive = false;
+  let recordingPaused = false;
+  let recordElapsedMs = 0;
+  let recordTimer: number | null = null;
+
+  function formatRecTime(ms: number): string {
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  function startRecTimer(): void {
+    if (recordTimer !== null) return;
+    recordTimer = window.setInterval(() => {
+      if (!recordingPaused) recordElapsedMs += 250;
+    }, 250);
+  }
+
+  function stopRecTimer(): void {
+    if (recordTimer !== null) {
+      clearInterval(recordTimer);
+      recordTimer = null;
+    }
+  }
+
   function handleRecordState(state: RecordStateEvent): void {
     switch (state.phase) {
       case 'started':
         recordingActive = true;
-        notice = `⏺ 录屏中（悬浮球已隐藏），按 Alt+V 停止；保存到：${state.path ?? ''}`;
+        recordingPaused = state.paused;
+        if (recordingPaused) {
+          notice = '⏸ 录制已暂停；点击 ▶ 继续';
+        } else {
+          notice = '⏺ 录屏中；点击 ⏸ 暂停，⏹ 停止并保存';
+          startRecTimer();
+        }
         break;
       case 'saving':
+        recordingPaused = false;
+        stopRecTimer();
         notice = '⏺ 正在结束录屏并保存…';
         break;
       case 'saved':
         recordingActive = false;
+        recordingPaused = false;
+        stopRecTimer();
+        recordElapsedMs = 0;
         notice = state.path ? `✅ 录屏已保存：${state.path}` : '✅ 录屏已停止';
         break;
       case 'recovering':
         recordingActive = false;
+        recordingPaused = false;
+        stopRecTimer();
+        recordElapsedMs = 0;
         void runCommand<RecoveryItem[]>('record.recovery.list')
           .then((items) => {
             notice = `⚠️ ${state.message ?? '录屏收尾异常'}；恢复区现有 ${items.length} 个文件${state.path ? `：${state.path}` : ''}`;
@@ -265,20 +309,69 @@
     }
   }
 
-  let recordingActive = false;
-  async function toggleRecord() {
+  // 未配置保存目录时弹窗选择；配置过则直接复用（设置面板可随时修改）。
+  async function ensureRecordDir(): Promise<string | null> {
+    const existing = localStorage.getItem(RECORD_DIR_KEY);
+    if (existing) {
+      recordDir = existing;
+      return existing;
+    }
+    if (!desktopBridgeAvailable) { notice = '请在桌面端使用录屏。'; return null; }
+    try {
+      const picked = await open({ directory: true, multiple: false, title: '选择录屏保存位置' });
+      if (!picked || typeof picked !== 'string') return null;
+      localStorage.setItem(RECORD_DIR_KEY, picked);
+      recordDir = picked;
+      return picked;
+    } catch (e) { notice = `选择目录失败：${String(e)}`; return null; }
+  }
+
+  async function toggleRecord(): Promise<void> {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用录屏。'; return; }
     if (!recordingActive) {
+      const dir = await ensureRecordDir();
+      if (!dir) { notice = '未选择保存位置，已取消录制。'; return; }
       try {
-        await runCommand<string>('record.start');
+        await runCommand<string>('record.start', { outputDir: dir });
         recordingActive = true;
+        recordingPaused = false;
+        recordElapsedMs = 0;
+        startRecTimer();
       } catch (e) { notice = `录屏启动失败：${String(e)}`; }
     } else {
-      try {
-        await runCommand<string | null>('record.stop');
-        recordingActive = false;
-      } catch (e) { notice = `录屏停止失败：${String(e)}`; }
+      await togglePause();
     }
+  }
+
+  async function togglePause(): Promise<void> {
+    if (!recordingActive) return;
+    try {
+      if (!recordingPaused) await runCommand('record.pause');
+      else await runCommand('record.resume');
+    } catch (e) { notice = `暂停/继续失败：${String(e)}`; }
+  }
+
+  async function stopRecord(): Promise<void> {
+    try {
+      await runCommand<string | null>('record.stop');
+    } catch (e) { notice = `录屏停止失败：${String(e)}`; }
+  }
+
+  // 设置面板里主动选择/清除录屏保存目录（与 ensureRecordDir 共用 localStorage）。
+  async function pickRecordDir(): Promise<void> {
+    if (!desktopBridgeAvailable) return;
+    try {
+      const picked = await open({ directory: true, multiple: false, title: '选择录屏保存位置' });
+      if (picked && typeof picked === 'string') {
+        localStorage.setItem(RECORD_DIR_KEY, picked);
+        recordDir = picked;
+      }
+    } catch (e) { notice = `选择目录失败：${String(e)}`; }
+  }
+
+  function clearRecordDir(): void {
+    localStorage.removeItem(RECORD_DIR_KEY);
+    recordDir = null;
   }
 
   async function runOcr() {
@@ -1036,13 +1129,24 @@
   class:right-docked={dockPosition === 'right'}
   class="app-shell"
 >
-  {#if panelOpen}
+  {#if recordingActive}
+    <div class="rec-control">
+      <span class="rec-timer">{formatRecTime(recordElapsedMs)}</span>
+      <div class="rec-buttons">
+        <button class="rec-btn" type="button" onclick={togglePause} aria-label={recordingPaused ? '继续录制' : '暂停录制'}>{recordingPaused ? '▶' : '⏸'}</button>
+        <button class="rec-btn stop" type="button" onclick={stopRecord} aria-label="停止并保存">⏹</button>
+      </div>
+    </div>
+  {:else if panelOpen}
     {#if settingsOpen && !editMode}
       <DiscSettings
         autostartConfigured={autostartConfigured}
         setupRunning={setupRunning}
         {notice}
         layoutCount={discLayout.length}
+        recordDir={recordDir}
+        onpickrecorddir={pickRecordDir}
+        onclearrecorddir={clearRecordDir}
         onedit={startEdit}
         ontoggleautostart={() => void toggleAutostart()}
         onquit={() => void quitApp()}

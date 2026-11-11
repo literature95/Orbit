@@ -685,11 +685,25 @@ fn resolve_ffmpeg(app: &AppHandle) -> std::path::PathBuf {
     std::path::PathBuf::from("ffmpeg")
 }
 
-struct RecordState(Mutex<Option<RecordHandle>>);
+struct RecordState(Mutex<Option<Recording>>);
 struct RecordHandle {
     path: String,
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
+}
+
+/// 一次录制会话：由若干段组成，暂停时结束当前段，继续时开启新段，
+/// 停止时把所有段拼接成单个 MP4。gdigrab 无原生暂停，分段拼接让
+/// 暂停期间不计入最终时间轴（复刻 Kiri 的活跃时钟语义）。
+struct Recording {
+    ffmpeg: std::path::PathBuf,
+    region: Option<ResolvedRegion>,
+    output_dir: std::path::PathBuf,
+    base_name: String,
+    final_path: std::path::PathBuf,
+    segments: Vec<std::path::PathBuf>,
+    current: Option<RecordHandle>,
+    paused: bool,
 }
 
 /// 录屏区域经显示器 origin 换算后的 gdigrab 虚拟桌面绝对坐标。
@@ -808,7 +822,8 @@ pub(crate) fn list_recovery_impl(app: &AppHandle) -> Result<Vec<RecoveryItem>, S
     list_recovery_items(&recovery_dir(app)?)
 }
 
-/// gdigrab 捕获屏幕像素，无法像 WGC 那样排除自身窗口；录制期间隐藏悬浮球。
+/// 切换悬浮球主窗口可见性。录制期间不再隐藏（改为显示计时），
+/// gdigrab 无法像 WGC 那样排除自身窗口，接受其进入录制画面。
 fn set_main_visible(app: &AppHandle, visible: bool) {
     if let Some(window) = app.get_webview_window("main") {
         let result = if visible { window.show() } else { window.hide() };
@@ -818,11 +833,18 @@ fn set_main_visible(app: &AppHandle, visible: bool) {
     }
 }
 
-fn emit_record_state(app: &AppHandle, phase: &str, path: Option<String>, message: Option<String>) {
+fn emit_record_state(
+    app: &AppHandle,
+    phase: &str,
+    path: Option<String>,
+    message: Option<String>,
+    paused: bool,
+) {
     let event = RecordStateEvent {
         phase: phase.to_string(),
         path,
         message,
+        paused,
     };
     if let Err(error) = bus::emit(app, "record-state", &event) {
         log::warn!("录屏状态事件发送失败：{error}");
@@ -832,32 +854,97 @@ fn emit_record_state(app: &AppHandle, phase: &str, path: Option<String>, message
 pub(crate) fn record_start_impl(
     app: &AppHandle,
     region: Option<CaptureRegion>,
+    output_dir: Option<String>,
 ) -> Result<String, String> {
-    if app.state::<RecordState>().0.lock().unwrap().is_some() {
+    let state = app.state::<RecordState>();
+    let mut guard = state.0.lock().unwrap();
+    if guard.is_some() {
         return Err("已经在录制中".to_string());
     }
     let ffmpeg = resolve_ffmpeg(app);
     let resolved = region.as_ref().map(resolve_record_region).transpose()?;
 
-    // 生成输出路径：桌面/Orbit/orbit_rec_*.mp4
-    let home = std::env::var("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(std::path::PathBuf::from))
-        .map_err(|_| "找不到用户目录".to_string())?;
-    let dir = home.join("Desktop").join("Orbit");
+    // 输出目录：优先使用前端配置的保存位置，缺省回退到桌面/Orbit。
+    let dir = match output_dir {
+        Some(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir),
+        _ => {
+            let home = std::env::var("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .or_else(|_| std::env::var("HOME").map(std::path::PathBuf::from))
+                .map_err(|_| "找不到用户目录".to_string())?;
+            home.join("Desktop").join("Orbit")
+        }
+    };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let filename = format!(
-        "orbit_rec_{}.mp4",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-    );
-    let path = dir.join(&filename);
-    let path_str = path.to_string_lossy().to_string();
-    let handle = spawn_ffmpeg_recording(&ffmpeg, &path_str, resolved.as_ref())?;
-    *app.state::<RecordState>().0.lock().unwrap() = Some(handle);
-    set_main_visible(app, false);
-    emit_record_state(app, "started", Some(path_str.clone()), None);
-    Ok(path_str)
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base_name = format!("orbit_rec_{}", stamp);
+    let final_path = dir.join(format!("{}.mp4", base_name));
+    let seg0 = dir.join(format!("{}_seg0.mp4", base_name));
+    let seg0_str = seg0.to_string_lossy().to_string();
+    let handle = spawn_ffmpeg_recording(&ffmpeg, &seg0_str, resolved.as_ref())?;
+    let recording = Recording {
+        ffmpeg,
+        region: resolved,
+        output_dir: dir.clone(),
+        base_name,
+        final_path: final_path.clone(),
+        segments: Vec::new(),
+        current: Some(handle),
+        paused: false,
+    };
+    *guard = Some(recording);
+    drop(guard);
+    set_main_visible(app, true);
+    emit_record_state(app, "started", None, None, false);
+    Ok(final_path.to_string_lossy().to_string())
+}
+
+/// 暂停：优雅结束当前段并标记为暂停态；继续时再开启新段。
+pub(crate) fn record_pause_impl(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<RecordState>();
+    let mut guard = state.0.lock().unwrap();
+    let recording = guard
+        .as_mut()
+        .ok_or_else(|| "没有正在录制的会话".to_string())?;
+    if recording.paused {
+        return Err("已经在暂停状态".to_string());
+    }
+    if let Some(handle) = recording.current.take() {
+        let dir = recovery_dir(app)
+            .unwrap_or_else(|_| std::env::temp_dir().join("orbit-record-recovery"));
+        let outcome = finish_recording(handle, &dir)?;
+        recording.segments.push(std::path::PathBuf::from(outcome.path));
+    }
+    recording.paused = true;
+    drop(guard);
+    emit_record_state(app, "started", None, None, true);
+    Ok(())
+}
+
+/// 继续：暂停态下开启新段，恢复录制。
+pub(crate) fn record_resume_impl(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<RecordState>();
+    let mut guard = state.0.lock().unwrap();
+    let recording = guard
+        .as_mut()
+        .ok_or_else(|| "没有正在录制的会话".to_string())?;
+    if !recording.paused {
+        return Err("当前未处于暂停状态".to_string());
+    }
+    let seg_index = recording.segments.len();
+    let seg_path = recording
+        .output_dir
+        .join(format!("{}_seg{}.mp4", recording.base_name, seg_index));
+    let seg_str = seg_path.to_string_lossy().to_string();
+    let handle = spawn_ffmpeg_recording(&recording.ffmpeg, &seg_str, recording.region.as_ref())?;
+    recording.current = Some(handle);
+    recording.paused = false;
+    drop(guard);
+    emit_record_state(app, "started", None, None, false);
+    Ok(())
 }
 
 /// 启动 FFmpeg gdigrab 录制，返回句柄；与测试共用。
@@ -959,40 +1046,119 @@ fn finish_recording(
 }
 
 pub(crate) async fn record_stop_impl(app: &AppHandle) -> Result<Option<String>, String> {
-    let handle = app
+    let recording = app
         .state::<RecordState>()
         .0
         .lock()
         .unwrap()
         .take()
         .ok_or_else(|| "没有正在录制的会话".to_string())?;
-
-    emit_record_state(app, "saving", None, None);
-    let dir = recovery_dir(app)
-        .unwrap_or_else(|_| std::env::temp_dir().join("orbit-record-recovery"));
-    let outcome = tauri::async_runtime::spawn_blocking(move || finish_recording(handle, &dir))
-        .await
-        .map_err(|error| format!("录屏停止线程异常退出：{error}"))?;
+    let paused = recording.paused;
     set_main_visible(app, true);
-    match outcome {
-        Ok(outcome) => {
-            if outcome.recovered {
-                emit_record_state(
-                    app,
-                    "recovering",
-                    Some(outcome.path.clone()),
-                    Some("录屏收尾超时，文件已移入恢复区".to_string()),
-                );
-            } else {
-                emit_record_state(app, "saved", Some(outcome.path.clone()), None);
-            }
-            Ok(Some(outcome.path))
+
+    emit_record_state(app, "saving", None, None, paused);
+    let mut segments = recording.segments;
+    if let Some(handle) = recording.current {
+        let dir = recovery_dir(app)
+            .unwrap_or_else(|_| std::env::temp_dir().join("orbit-record-recovery"));
+        let outcome = tauri::async_runtime::spawn_blocking(move || finish_recording(handle, &dir))
+            .await
+            .map_err(|error| format!("录屏停止线程异常退出：{error}"))??;
+        segments.push(std::path::PathBuf::from(outcome.path.clone()));
+        if outcome.recovered {
+            emit_record_state(
+                app,
+                "recovering",
+                Some(outcome.path.clone()),
+                Some("录屏收尾超时，文件已移入恢复区".to_string()),
+                false,
+            );
+            return Ok(Some(outcome.path));
+        }
+    }
+    let final_path = recording.final_path.clone();
+    match merge_segments(&segments, &final_path, &recording.ffmpeg) {
+        Ok(()) => {
+            emit_record_state(
+                app,
+                "saved",
+                Some(final_path.to_string_lossy().to_string()),
+                None,
+                false,
+            );
+            Ok(Some(final_path.to_string_lossy().to_string()))
         }
         Err(error) => {
-            emit_record_state(app, "recovering", None, Some(error.clone()));
+            emit_record_state(app, "recovering", None, Some(error.clone()), false);
             Err(error)
         }
     }
+}
+
+/// 把所有分段拼接成单个 MP4：单段直接重命名，多段用 concat demuxer 复制流。
+/// 各段参数一致（同一 gdigrab 命令行），-fflags +genpts 重新生成时间戳，
+/// 最终时长 = 各段之和，暂停期间不计入时间轴。
+fn merge_segments(
+    segments: &[std::path::PathBuf],
+    final_path: &std::path::Path,
+    ffmpeg: &std::path::Path,
+) -> Result<(), String> {
+    if segments.is_empty() {
+        return Err("没有可拼接的录制片段。".to_string());
+    }
+    if segments.len() == 1 {
+        let src = &segments[0];
+        if src.exists() {
+            if final_path.exists() {
+                let _ = std::fs::remove_file(final_path);
+            }
+            std::fs::rename(src, final_path)
+                .or_else(|_| std::fs::copy(src, final_path).and_then(|_| std::fs::remove_file(src)))
+                .map_err(|e| format!("单段重命名失败：{e}"))?;
+        }
+        return Ok(());
+    }
+    let list_path = std::env::temp_dir().join(format!(
+        "orbit_concat_{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut list_content = String::new();
+    for seg in segments {
+        let p = seg.to_string_lossy().replace('\\', "/");
+        list_content.push_str(&format!("file '{}'\n", p));
+    }
+    std::fs::write(&list_path, list_content).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(ffmpeg)
+        .no_window()
+        .args([
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-fflags",
+            "+genpts",
+            "-i",
+            &list_path.to_string_lossy(),
+            "-c",
+            "copy",
+            &final_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("FFmpeg 拼接失败：{e}"))?;
+    let _ = std::fs::remove_file(&list_path);
+    if !status.success() {
+        return Err("FFmpeg 拼接分段失败。".to_string());
+    }
+    for seg in segments {
+        let _ = std::fs::remove_file(seg);
+    }
+    Ok(())
 }
 
 // ============ OCR ============
@@ -1377,7 +1543,7 @@ pub fn run() {
                                 if event.state != ShortcutState::Pressed {
                                     return;
                                 }
-                                // 录制期间悬浮球被隐藏，Alt+V 临时承担停止入口；
+                                // 录制期间悬浮球显示计时，Alt+V 仍作备用停止入口；
                                 // 与 Kiri 一样只在录制状态下改变快捷键语义。
                                 let is_recording = app
                                     .state::<RecordState>()
@@ -1560,6 +1726,41 @@ mod smoke {
         assert_eq!(stream["width"].as_u64(), Some(320));
         assert_eq!(stream["height"].as_u64(), Some(240));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merge_segments_concatenates_into_single_mp4() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("跳过：未找到 ffmpeg / ffprobe");
+            return;
+        }
+        // 两段各录制约 1.5s，模拟「录一段 → 暂停 → 继续录一段」的分段产物。
+        let seg0 = temp_path("merge-seg0.mp4");
+        let seg1 = temp_path("merge-seg1.mp4");
+        let final_path = temp_path("merge-final.mp4");
+        let _ = record_and_probe(&seg0, None);
+        let _ = record_and_probe(&seg1, None);
+        merge_segments(
+            &[seg0.clone(), seg1.clone()],
+            &final_path,
+            &std::path::PathBuf::from("ffmpeg"),
+        )
+        .expect("分段拼接失败");
+        assert!(final_path.exists(), "拼接后应生成单个 MP4");
+        assert!(
+            !seg0.exists() && !seg1.exists(),
+            "拼接后应清理临时分段"
+        );
+        let meta = ffprobe_video_metadata(&final_path);
+        let duration: f64 = meta["format"]["duration"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        assert!(
+            duration > 2.5 && duration < 4.0,
+            "拼接后时长应≈两段之和≈3s（暂停期间不计入），实际 {duration}"
+        );
+        let _ = std::fs::remove_file(&final_path);
     }
 
     fn create_text_png(name: &str) -> std::path::PathBuf {
