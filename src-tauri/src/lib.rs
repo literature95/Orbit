@@ -17,6 +17,7 @@ mod bus;
 mod clipboard;
 mod elevated;
 mod input_recorder;
+mod ocr;
 mod screenshot;
 
 /// tauri.conf.json 只描述窗口初始尺寸；停靠/展开态尺寸集中在此，
@@ -1195,6 +1196,8 @@ fn parse_ocr_output(stdout: &[u8]) -> Result<OcrResult, String> {
     serde_json::from_str(payload).map_err(|error| format!("OCR 结果解析失败：{error}"))
 }
 
+/// Windows.Media.Ocr 后端的实际实现，经 `ocr::WindowsMediaOcr` 暴露给命令层。
+/// 本步只做抽象，不搬动 PowerShell 脚本，避免行为变化。
 pub(crate) fn ocr_image_blocking(image_path: &str) -> Result<OcrResult, String> {
     // Windows.Media.Ocr 通过 PowerShell 调用（Windows 10+ 内置）。
     // 路径经环境变量传入，不做字符串内插，避免引号破坏脚本或注入。
@@ -1310,7 +1313,7 @@ pub(crate) async fn ocr_current_screen_impl(window: &WebviewWindow) -> Result<Oc
         let _cleanup = TempFileGuard(tmp.clone());
 
         let path = tmp.to_string_lossy().to_string();
-        ocr_image_blocking(&path)
+        ocr::default_engine().recognize(&path)
     })
     .await
     .map_err(|error| format!("OCR 工作线程异常退出：{error}"))?

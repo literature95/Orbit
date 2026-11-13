@@ -574,7 +574,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                 run: sync(|_ctx, params| {
                     let OcrImageParams { image_path } = serde_json::from_value(params)
                         .map_err(|error| format!("参数不合法：{error}"))?;
-                    crate::ocr_image_blocking(&image_path)
+                    crate::ocr::default_engine().recognize(&image_path)
                 }),
             },
         );
