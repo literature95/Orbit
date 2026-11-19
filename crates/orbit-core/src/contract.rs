@@ -1,3 +1,5 @@
+use crate::bindings::{BindingAction, BindingEvent, BindingsConfig, Modifier};
+use crate::error::ErrorKind;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +17,8 @@ pub enum CommandCategory {
     Convert,
     Theme,
     System,
+    Binding,
+    Remote,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
@@ -53,6 +57,8 @@ pub struct CommandResponse {
     #[ts(type = "unknown | null")]
     pub data: Option<Value>,
     pub error: Option<String>,
+    /// 失败时的错误类别；成功时为 null。前端据此区分参数/权限/超时等分支。
+    pub error_kind: Option<ErrorKind>,
     #[ts(type = "number")]
     pub duration_ms: u64,
 }
@@ -264,6 +270,15 @@ pub struct RecoveryItem {
 #[ts(export)]
 pub struct SetOverlayOpenParams {
     pub open: bool,
+}
+
+/// 设置中心球半径（px）：全局统一，折叠态窗口边长随之变为半径 × 2。
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct SetBallRadiusParams {
+    pub radius: f64,
 }
 
 /// 系统权限状态：当前仅占位，等待平台授权流程接入。
@@ -478,12 +493,171 @@ pub struct KbEvent {
     pub direction: Option<String>,
 }
 
+/// 事件绑定 upsert：同一 (event, modifier) 已存在时覆盖动作。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpsertEventBindingParams {
+    pub event: BindingEvent,
+    #[serde(default)]
+    pub modifier: Modifier,
+    pub action: BindingAction,
+}
+
+/// 事件绑定键：删除与分发共用。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventBindingKeyParams {
+    pub event: BindingEvent,
+    #[serde(default)]
+    pub modifier: Modifier,
+}
+
+/// 全局快捷键 upsert：同一加速键已存在时覆盖动作。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpsertShortcutParams {
+    pub accelerator: String,
+    pub action: BindingAction,
+}
+
+/// 删除全局快捷键。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveShortcutParams {
+    pub accelerator: String,
+}
+
+/// 已保存的键鼠录制（列表项，不含事件体）。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct RecordingItem {
+    pub id: String,
+    pub name: String,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    pub platform: String,
+    pub event_count: u32,
+}
+
+/// 回放参数：录制 id + 可选倍速（0.1 ~ 10，缺省 1.0）。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct KbReplayParams {
+    pub recording_id: String,
+    pub speed: Option<f64>,
+}
+
+/// 回放结果：实际耗时与相对录制时间轴的漂移（P-09 指标）。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct KbReplayResult {
+    pub recording_id: String,
+    pub event_count: u32,
+    #[ts(type = "number")]
+    pub elapsed_ms: u64,
+    #[ts(type = "number")]
+    pub drift_ms: i64,
+}
+
+/// 鼠标控制动作：绝对移动 / 点击 / 滚轮。仅本地会话内合成，不跨进程转发。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum MouseAction {
+    Move,
+    Click,
+    Scroll,
+}
+
+/// 本地鼠标控制参数：`action` 决定读取哪组字段，无关字段应省略。
+/// `button` 取值 Left / Right / Middle / X1 / X2；`count` 为连击次数（缺省 1）；
+/// `amount` 为滚轮步数，正值向上。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct InputMouseParams {
+    pub action: MouseAction,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub button: Option<String>,
+    pub count: Option<u32>,
+    pub amount: Option<i32>,
+}
+
+/// 键鼠录制状态事件：录制启停时由主进程广播，前端据此同步悬浮球状态。
+/// 敏感上下文过滤跳过的按键数以 `redactedCount` 暴露，便于用户知晓。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KbRecordStateEvent {
+    pub active: bool,
+    #[ts(type = "number")]
+    pub redacted_count: u32,
+}
+
+/// 远程只读服务启动参数：端口缺省或 0 时由系统分配回环端口。
+/// 服务始终只绑定 127.0.0.1，跨机访问必须经公司 VPN 或 SSH 隧道。
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct RemoteStartParams {
+    pub port: Option<u16>,
+}
+
+/// 远程只读服务端点与一次性配对令牌。
+/// 令牌只保存在内存中，服务停止或应用退出即失效。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RemoteEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub token: String,
+}
+
+/// 远程只读服务状态；状态查询不返回令牌。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RemoteStatus {
+    pub running: bool,
+    pub endpoint: Option<String>,
+    pub active_sessions: u32,
+}
+
+/// 控制器连接参数。`endpoint` 只接受回环地址，避免绕过 VPN/隧道直连公网。
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export)]
+pub struct RemoteRequestParams {
+    pub endpoint: String,
+    pub token: String,
+    pub monitor_id: Option<u32>,
+}
+
+/// 远程截图结果：PNG 已写入本机剪贴板，只返回尺寸。
+#[derive(Clone, Copy, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RemoteScreenshotResult {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// 已登记事件目录。新增事件必须同时在此登记，
 /// `bus::emit` 在发送前校验 id，避免出现前端监听不到的事件名。
 pub fn event_catalog() -> Result<Vec<EventSpec>, serde_json::Error> {
     let changed_payload = serde_json::to_value(schemars::schema_for!(ClipboardChanged))?;
     let selection_payload = serde_json::to_value(schemars::schema_for!(RegionSelectionStart))?;
     let record_state_payload = serde_json::to_value(schemars::schema_for!(RecordStateEvent))?;
+    let kb_record_state_payload = serde_json::to_value(schemars::schema_for!(KbRecordStateEvent))?;
+    let bindings_changed_payload = serde_json::to_value(schemars::schema_for!(BindingsConfig))?;
+    let remote_state_payload = serde_json::to_value(schemars::schema_for!(RemoteStatus))?;
     let null_payload = serde_json::json!({ "type": "null" });
     Ok(vec![
         EventSpec {
@@ -506,6 +680,21 @@ pub fn event_catalog() -> Result<Vec<EventSpec>, serde_json::Error> {
             label: "录屏状态变化",
             payload_schema: record_state_payload,
         },
+        EventSpec {
+            id: "kb-record-state",
+            label: "键鼠录制状态变化",
+            payload_schema: kb_record_state_payload,
+        },
+        EventSpec {
+            id: "binding://changed",
+            label: "事件绑定配置变化",
+            payload_schema: bindings_changed_payload,
+        },
+        EventSpec {
+            id: "remote://state",
+            label: "远程只读服务状态变化",
+            payload_schema: remote_state_payload,
+        },
     ])
 }
 
@@ -518,6 +707,7 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let monitor_returns = serde_json::to_value(schemars::schema_for!(MonitorSnapshot))?;
     let overlay_returns = serde_json::to_value(schemars::schema_for!(OverlaySnapshot))?;
     let overlay_open_params = serde_json::to_value(schemars::schema_for!(SetOverlayOpenParams))?;
+    let ball_radius_params = serde_json::to_value(schemars::schema_for!(SetBallRadiusParams))?;
     let setup_returns = serde_json::to_value(schemars::schema_for!(SetupResult))?;
     let autostart_params = serde_json::to_value(schemars::schema_for!(SetAutostartParams))?;
     let clip_list_params = serde_json::to_value(schemars::schema_for!(ClipListParams))?;
@@ -532,10 +722,26 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let elevated_params = serde_json::to_value(schemars::schema_for!(SetElevatedParams))?;
     let command_response_returns = serde_json::to_value(schemars::schema_for!(CommandResponse))?;
     let kb_events_returns = serde_json::to_value(schemars::schema_for!(Vec<KbEvent>))?;
+    let recording_list_returns = serde_json::to_value(schemars::schema_for!(Vec<RecordingItem>))?;
+    let kb_replay_params = serde_json::to_value(schemars::schema_for!(KbReplayParams))?;
+    let kb_replay_returns = serde_json::to_value(schemars::schema_for!(KbReplayResult))?;
+    let input_mouse_params = serde_json::to_value(schemars::schema_for!(InputMouseParams))?;
     let layout_returns = serde_json::to_value(schemars::schema_for!(WindowLayout))?;
     let ocr_result_returns = serde_json::to_value(schemars::schema_for!(OcrResult))?;
     let record_start_params = serde_json::to_value(schemars::schema_for!(RecordStartParams))?;
     let recovery_returns = serde_json::to_value(schemars::schema_for!(Vec<RecoveryItem>))?;
+    let bindings_returns = serde_json::to_value(schemars::schema_for!(BindingsConfig))?;
+    let upsert_event_params = serde_json::to_value(schemars::schema_for!(UpsertEventBindingParams))?;
+    let event_key_params = serde_json::to_value(schemars::schema_for!(EventBindingKeyParams))?;
+    let upsert_shortcut_params = serde_json::to_value(schemars::schema_for!(UpsertShortcutParams))?;
+    let remove_shortcut_params = serde_json::to_value(schemars::schema_for!(RemoveShortcutParams))?;
+    let dispatch_returns = serde_json::to_value(schemars::schema_for!(serde_json::Value))?;
+    let remote_start_params = serde_json::to_value(schemars::schema_for!(RemoteStartParams))?;
+    let remote_endpoint_returns = serde_json::to_value(schemars::schema_for!(RemoteEndpoint))?;
+    let remote_status_returns = serde_json::to_value(schemars::schema_for!(RemoteStatus))?;
+    let remote_request_params = serde_json::to_value(schemars::schema_for!(RemoteRequestParams))?;
+    let remote_screenshot_returns =
+        serde_json::to_value(schemars::schema_for!(RemoteScreenshotResult))?;
     let string_returns = serde_json::json!({ "type": "string" });
     let optional_string_returns = serde_json::json!({ "type": ["string", "null"] });
     let number_returns = serde_json::json!({ "type": "number" });
@@ -593,6 +799,15 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             category: CommandCategory::System,
             risk: RiskLevel::Mutating,
             params_schema: overlay_open_params,
+            returns_schema: null_returns.clone(),
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "overlay.set_ball_radius",
+            label: "设置中心球半径（折叠态窗口随之缩放）",
+            category: CommandCategory::System,
+            risk: RiskLevel::Mutating,
+            params_schema: ball_radius_params,
             returns_schema: null_returns.clone(),
             idempotent: true,
         },
@@ -836,7 +1051,7 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             category: CommandCategory::Ocr,
             risk: RiskLevel::ReadOnly,
             params_schema: empty_params.clone(),
-            returns_schema: ocr_result_returns,
+            returns_schema: ocr_result_returns.clone(),
             idempotent: true,
         },
         CommandSpec {
@@ -855,6 +1070,33 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             risk: RiskLevel::Mutating,
             params_schema: empty_params.clone(),
             returns_schema: kb_events_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "kb_record.list",
+            label: "列出已保存的键鼠录制",
+            category: CommandCategory::Input,
+            risk: RiskLevel::ReadOnly,
+            params_schema: empty_params.clone(),
+            returns_schema: recording_list_returns,
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "kb.replay",
+            label: "回放键鼠录制",
+            category: CommandCategory::Input,
+            risk: RiskLevel::Mutating,
+            params_schema: kb_replay_params,
+            returns_schema: kb_replay_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "input.mouse",
+            label: "鼠标控制",
+            category: CommandCategory::Input,
+            risk: RiskLevel::Mutating,
+            params_schema: input_mouse_params,
+            returns_schema: null_returns.clone(),
             idempotent: false,
         },
         CommandSpec {
@@ -908,8 +1150,108 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             category: CommandCategory::System,
             risk: RiskLevel::ReadOnly,
             params_schema: empty_params.clone(),
-            returns_schema: bool_returns,
+            returns_schema: bool_returns.clone(),
             idempotent: true,
+        },
+        CommandSpec {
+            id: "binding.list",
+            label: "读取事件绑定配置",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::ReadOnly,
+            params_schema: empty_params.clone(),
+            returns_schema: bindings_returns.clone(),
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "binding.dispatch",
+            label: "按事件绑定执行动作",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::Mutating,
+            params_schema: event_key_params.clone(),
+            returns_schema: dispatch_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "binding.upsert_event",
+            label: "写入事件绑定",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::Mutating,
+            params_schema: upsert_event_params,
+            returns_schema: bindings_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "binding.remove_event",
+            label: "删除事件绑定",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::Mutating,
+            params_schema: event_key_params,
+            returns_schema: bindings_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "binding.upsert_shortcut",
+            label: "写入全局快捷键",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::Mutating,
+            params_schema: upsert_shortcut_params,
+            returns_schema: bindings_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "binding.remove_shortcut",
+            label: "删除全局快捷键",
+            category: CommandCategory::Binding,
+            risk: RiskLevel::Mutating,
+            params_schema: remove_shortcut_params,
+            returns_schema: bindings_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "remote.serve.start",
+            label: "启动远程只读服务",
+            category: CommandCategory::Remote,
+            risk: RiskLevel::Mutating,
+            params_schema: remote_start_params,
+            returns_schema: remote_endpoint_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "remote.serve.stop",
+            label: "停止远程只读服务",
+            category: CommandCategory::Remote,
+            risk: RiskLevel::Mutating,
+            params_schema: empty_params.clone(),
+            returns_schema: bool_returns.clone(),
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "remote.status",
+            label: "读取远程只读服务状态",
+            category: CommandCategory::Remote,
+            risk: RiskLevel::ReadOnly,
+            params_schema: empty_params.clone(),
+            returns_schema: remote_status_returns,
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "remote.screenshot",
+            label: "抓取远程截图到本机剪贴板",
+            category: CommandCategory::Remote,
+            risk: RiskLevel::Mutating,
+            params_schema: remote_request_params.clone(),
+            returns_schema: remote_screenshot_returns,
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "remote.ocr",
+            label: "远程 OCR 识别",
+            category: CommandCategory::Remote,
+            // 刻意标记为 Mutating：避免只读 MCP 白名单自动暴露远程屏幕读取能力。
+            risk: RiskLevel::Mutating,
+            params_schema: remote_request_params,
+            returns_schema: ocr_result_returns,
+            idempotent: false,
         },
     ])
 }
@@ -931,6 +1273,7 @@ mod tests {
                 "system.monitor",
                 "overlay.dock",
                 "overlay.set_open",
+                "overlay.set_ball_radius",
                 "overlay.layout",
                 "app.setup.status",
                 "app.setup.complete",
@@ -960,12 +1303,26 @@ mod tests {
                 "ocr.current_screen",
                 "kb_record.start",
                 "kb_record.stop",
+                "kb_record.list",
+                "kb.replay",
+                "input.mouse",
                 "convert.format",
                 "region.start",
                 "region.finish",
                 "region.cancel",
                 "elevated.set",
                 "elevated.status",
+                "binding.list",
+                "binding.dispatch",
+                "binding.upsert_event",
+                "binding.remove_event",
+                "binding.upsert_shortcut",
+                "binding.remove_shortcut",
+                "remote.serve.start",
+                "remote.serve.stop",
+                "remote.status",
+                "remote.screenshot",
+                "remote.ocr",
             ]
         );
         let screenshot = &catalog[0];
@@ -995,7 +1352,11 @@ mod tests {
     #[test]
     fn recording_contracts_cover_region_events_and_recovery() {
         let catalog = command_catalog().unwrap();
-        assert_eq!(catalog.len(), 41, "命令目录应包含 pause/resume 与恢复区清单命令");
+        assert_eq!(
+            catalog.len(),
+            56,
+            "命令目录应包含绑定层 6 条、回放 2 条、远程只读 5 条、鼠标控制 1 条与球半径 1 条命令"
+        );
         let start = catalog
             .iter()
             .find(|spec| spec.id == "record.start")
@@ -1077,9 +1438,66 @@ mod tests {
                 "clip://shown",
                 "region-selection-start",
                 "record-state",
+                "kb-record-state",
+                "binding://changed",
+                "remote://state",
             ]
         );
         assert!(catalog.iter().all(|spec| spec.payload_schema.is_object()));
+    }
+
+    #[test]
+    fn input_mouse_catalog_entry_is_mutating_input() {
+        let catalog = command_catalog().unwrap();
+        let spec = catalog
+            .iter()
+            .find(|spec| spec.id == "input.mouse")
+            .expect("命令目录缺少 input.mouse");
+        assert_eq!(spec.label, "鼠标控制");
+        assert_eq!(spec.category, CommandCategory::Input);
+        assert_eq!(spec.risk, RiskLevel::Mutating);
+        assert!(!spec.idempotent);
+
+        let props = spec.params_schema["properties"]
+            .as_object()
+            .expect("input.mouse 参数 schema 缺少 properties");
+        assert!(props.contains_key("action"), "缺少 action 字段");
+        assert!(props.contains_key("button"), "缺少 button 字段");
+    }
+
+    #[test]
+    fn input_mouse_params_reject_unknown_fields() {
+        let request = serde_json::from_value::<InputMouseParams>(serde_json::json!({
+            "action": "move",
+            "x": 100,
+            "y": 200,
+            "unexpected": true
+        }));
+        assert!(request.is_err());
+    }
+
+    #[test]
+    fn input_mouse_params_accept_move_click_scroll() {
+        let move_req = serde_json::from_value::<InputMouseParams>(serde_json::json!({
+            "action": "move", "x": 100, "y": 200
+        }))
+        .expect("move 应可反序列化");
+        assert_eq!(move_req.action, MouseAction::Move);
+        assert_eq!(move_req.x, Some(100));
+
+        let click_req = serde_json::from_value::<InputMouseParams>(serde_json::json!({
+            "action": "click", "button": "Left", "count": 2
+        }))
+        .expect("click 应可反序列化");
+        assert_eq!(click_req.action, MouseAction::Click);
+        assert_eq!(click_req.count, Some(2));
+
+        let scroll_req = serde_json::from_value::<InputMouseParams>(serde_json::json!({
+            "action": "scroll", "amount": 3
+        }))
+        .expect("scroll 应可反序列化");
+        assert_eq!(scroll_req.action, MouseAction::Scroll);
+        assert_eq!(scroll_req.amount, Some(3));
     }
 
     #[test]
@@ -1103,5 +1521,22 @@ mod tests {
             "startup": true
         }));
         assert!(autostart.is_err());
+    }
+
+    /// 绑定参数的 TS 绑定需要显式导出（自动导出只覆盖叶子类型）。
+    #[test]
+    fn exports_binding_param_typescript_bindings() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bindings");
+        let cfg = ts_rs::Config::new().with_out_dir(&dir);
+        UpsertEventBindingParams::export_all(&cfg).expect("导出 UpsertEventBindingParams 失败");
+        EventBindingKeyParams::export_all(&cfg).expect("导出 EventBindingKeyParams 失败");
+        UpsertShortcutParams::export_all(&cfg).expect("导出 UpsertShortcutParams 失败");
+        RemoveShortcutParams::export_all(&cfg).expect("导出 RemoveShortcutParams 失败");
+        RecordingItem::export_all(&cfg).expect("导出 RecordingItem 失败");
+        KbReplayParams::export_all(&cfg).expect("导出 KbReplayParams 失败");
+        KbReplayResult::export_all(&cfg).expect("导出 KbReplayResult 失败");
+        MouseAction::export_all(&cfg).expect("导出 MouseAction 失败");
+        InputMouseParams::export_all(&cfg).expect("导出 InputMouseParams 失败");
+        KbRecordStateEvent::export_all(&cfg).expect("导出 KbRecordStateEvent 失败");
     }
 }

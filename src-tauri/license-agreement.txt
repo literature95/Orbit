@@ -1,0 +1,152 @@
+Orbit（轨道）—— 安装与使用确认协议
+Orbit Desktop v0.1.0 安装程序
+
+══════════════════════════════════════════════════════════════
+  重要提示：请完整阅读本协议后再决定是否安装。
+  本软件属于 RAT（Remote Administration Tool，远程管理/监控
+  工具）同类能力范畴的软件：键鼠全局监听、屏幕捕获、剪贴板记
+  录、远程只读访问等桌面监控与远程访问能力真实存在（清单见
+  第一节）；但 stager/stage 分阶段加载、反向/绑定 TCP 会话、
+  进程注入与迁移、内存反射执行等植入端技术本软件不含有（逐
+  条边界见第二节）。如果你不是这台设备的所有者、或未获得设备
+  所有者的明确授权，请立即点击「取消」退出安装。
+══════════════════════════════════════════════════════════════
+
+一、能力披露——本软件具备下列监控与远程访问能力
+
+  1. 键盘与鼠标全局监听（键盘记录器）：
+     安装后本软件可注册系统级低级钩子（WH_KEYBOARD_LL /
+     WH_MOUSE_LL），在后台记录键盘输入与鼠标操作，并将录制
+     结果保存到本机数据库（recordings.db）。
+
+  2. 键鼠自动回放（自动输入）：
+     本软件可按录制脚本自动模拟键盘输入与鼠标点击，实现
+     无人值守的桌面操作。
+
+  3. 屏幕捕获：
+     可截取全屏、指定显示器或任意区域画面。
+
+  4. OCR 屏幕文字识别：
+     可识别截屏画面中的文字（本机 WinRT 引擎）。
+
+  5. 剪贴板监控：
+     持续监听并记录剪贴板内容（文本 / 文件列表 / 图片）。
+
+  6. 管理员权限辅助进程：
+     启用「管理员增强」后，会以管理员权限运行独立 helper
+     进程（用于 CPU 温度采样）。
+
+  7. 本地 MCP 工具接口：
+     通过 127.0.0.1 本地回环向 MCP 客户端（如 AI 助手）暴露
+     只读工具。
+
+  8. 远程只读配对服务（默认关闭）：
+     可在 127.0.0.1 上启动带一次性令牌的只读服务，允许另
+     一台你授权的 Orbit 机器（经你自建的 VPN / SSH 隧道）
+     请求本机截图或本机 OCR 结果；对端无法在本机执行任何
+     命令、注入输入或传输文件。
+
+二、植入端技术边界——下列远程入侵/植入体标志性能力
+    本软件【不含有】
+
+  本节负面清单与第一节能力清单同等效力。每条「不存在」
+  覆盖本软件全部行为，包括其调用的子进程、sidecar 与可
+  选远程组件；安装前可在公开源码仓库逐条核对。
+
+  1. stager / stage 分阶段加载：无任何从网络下载二进制、
+     脚本或后续载荷并执行的逻辑；不存在 dropper/stager 阶
+     段。唯一的「远程取回」是可选的远程 OCR 与远程只读配
+     对，取回物仅为 OCR 文本与截图像素数据，不进入任何执
+     行路径（不落盘为可执行文件、不被执行、不注册自启）。
+
+  2. 反向 TCP 会话（reverse shell / 反连 C2）：无任何主
+     动连出到外部主机并等待下发命令的通道。出站连接仅三
+     处——① 远程 OCR 客户端连向你显式配置的 OCR 服务端；
+     ② 远程只读客户端连向你显式填写的、且仅允许回环
+     （127.0.0.1）的对端端点；③ MCP sidecar 连接本机
+     MCP 桥。均无「对端发指令、本机执行」语义。
+
+  3. 绑定 TCP 会话（bind shell）：无监听端口并等待外部
+     任意来源连接后执行命令的入口。本地监听仅两处，全部
+     固定绑定 127.0.0.1 回环——MCP 桥（随机端口 + 一次性
+     token 首行鉴权）与远程只读配对服务（一次性 256-bit
+     令牌，能力白名单仅截图/OCR，默认关闭）。应用本体无
+     0.0.0.0 / 公网监听、无 NAT 穿透、无中继打洞。可选的
+     orbit-ocr-server 是你自行单独部署运行的程序（默认
+     127.0.0.1:8787），不属于本安装包安装的应用本体。
+
+  4. 进程注入与迁移（process injection / migration）：
+     不存在向其他进程写入代码、数据或在其内部创建线程/
+     回调的任何调用——CreateRemoteThread / WriteProcess
+     Memory / VirtualAllocEx / NtCreateThreadEx /
+     QueueUserAPC / SetWindowsHookEx 跨进程注入等原语均
+     未使用。本软件不驻留、不修改任何第三方进程的内存与
+     行为。
+
+  5. 内存反射执行（reflective loading / shellcode）：
+     不存在在内存中构造或执行无文件载荷的路径——无内存
+     分配后写入机器码、无 PE/反射式 DLL 加载器、无从内存
+     解密展开执行。全部可执行代码均为本安装包携带的原生
+     二进制，以及你自行安装并授权调用的 FFmpeg 等子进程。
+
+  6. 持久化边界：本软件唯一的持久化手段是可选的「登录
+     启动」注册表项（HKCU Run 键，由 tauri-plugin-autostart
+     写入），在设置页显式开关、可随时移除；无计划任务、
+     服务安装、WMI 事件订阅、启动文件夹投放、映像劫持等
+     隐藏持久化。
+
+三、数据处理边界
+
+  第一节所列能力采集的全部数据默认仅保存在本机应用数据目
+  录（键鼠录制、剪贴板历史、截图产物），本软件不内置任何
+  向作者或第三方的上传通道、不连接任何作者服务器、审计日
+  志不外发内容。两类可选远程功能仅在你不主动启动、不显式
+  配置端点与令牌时完全不产生网络流量：远程 OCR 会把你选择
+  的截图上传到你配置的服务端；远程只读配对会把本机截图或
+  OCR 结果回传给持有令牌的对端机器。
+
+四、使用条件（安装即视为逐条确认）
+
+  1. 你确认：你是本设备的所有者，或已获得设备所有者的
+     明确、知情授权。
+
+  2. 你确认：你已知晓本软件具备键盘记录、自动输入、屏幕
+     捕获、剪贴板记录与可选远程只读访问能力。
+
+  3. 你承诺：不将本软件用于未经授权的监控。在他人设备上
+     未经同意安装或运行本软件属于违法行为，相关法律责任
+     由使用者自行承担。
+
+  4. 你知晓：系统级监听与回放能力与攻击性工具共享能力面，
+     该风险是此类软件的固有属性。请只在可信环境中安装运行。
+
+  5. 你知晓：本软件按「现状」提供，作者不对任何滥用行为
+     及由此造成的损失承担责任。
+
+五、你的选择
+
+  ▸ 点击「我接受」：表示你已阅读、理解并接受以上全部条款
+    （含第一节能力清单与第二节负面清单），安装将继续。
+  ▸ 点击「取消」：放弃安装，本软件不会写入任何文件。
+
+──────────────────────────────────────────────────────────────
+English summary (full terms in Chinese above):
+Orbit is a desktop automation hub whose capability set is
+equivalent to a Remote Administration Tool (RAT): global
+keyboard/mouse hooking (keylogging), automated input replay,
+screen capture, OCR, clipboard monitoring, an optional
+elevated helper, a local read-only MCP tool interface, and an
+opt-in loopback-only remote read-only pairing service. The
+following implant-side techniques are NOT present in this
+software: stager/staged payload loading, reverse or bound
+TCP command sessions, process injection or migration, and
+in-memory reflective execution — all outbound connections
+require endpoints you explicitly configure, and all listeners
+bind to 127.0.0.1 only. Captured data stays on this machine
+by default; optional remote OCR / pairing features activate
+only when you start them and supply your own endpoints and
+tokens. By clicking "I Agree" you confirm that you own this
+device or have the owner's explicit consent, and that you
+will not use this software for unauthorized surveillance.
+Click "Cancel" to abort installation.
+──────────────────────────────────────────────────────────────

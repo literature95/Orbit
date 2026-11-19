@@ -241,7 +241,7 @@ button:focus-visible { outline: 3px solid var(--accent-violet); outline-offset: 
   top: 50%;
   transform: translate(-50%, -50%);
   transform-origin: center;
-  width: 82px;
+  width: var(--orb-size, 82px);
   aspect-ratio: 1;
   display: grid;
   place-items: center;
@@ -819,6 +819,66 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
   color: #0b0b14;
   font-weight: 600;
 }
+.remote-inputs {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.settings-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--panel-border);
+  background: var(--seg-fill);
+  color: var(--text-main);
+  font-size: 11px;
+}
+.settings-input::placeholder { color: var(--text-dim); }
+.settings-input:focus {
+  outline: none;
+  border-color: var(--accent-cyan);
+}
+.remote-actions {
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+.remote-actions .settings-btn { flex: 1; }
+.remote-token {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+}
+.remote-result {
+  max-height: 96px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* 远程只读服务运行时常驻角标：不依赖设置页也能看到 */
+.remote-badge {
+  position: fixed;
+  top: 2px;
+  right: 2px;
+  z-index: 20;
+  width: 14px;
+  height: 14px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-rose);
+  color: #0b0b14;
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1;
+  pointer-events: none;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, .25);
+}
 :root[data-theme="mono-light"] .settings-btn.primary { color: #fff; }
 :root[data-theme="orbit-white"] .settings-btn.primary {
   background: #fff;
@@ -917,6 +977,10 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
 }
 
 /* 圆盘编辑模式：拖动排序、拖出移除，圆盘本身就是编辑界面 */
+/* 编辑态把 SVG 提到中心球之上，让半径手柄（含贴着球边的圆点）可被命中；
+   "+"添加功能改由编辑栏按钮承担，球本身在编辑态不再吃指针事件。 */
+.disc.editing { z-index: 4; }
+.app-shell:has(.disc.editing) .orb-button { pointer-events: none; }
 .disc.editing .seg-group { cursor: grab; }
 .disc.editing .seg-group:active { cursor: grabbing; }
 .disc.editing .seg-group.edit-highlight .seg-fill {
@@ -940,7 +1004,8 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
 .edit-knob:hover circle { fill: var(--seg-fill-hover); }
 .edit-knob:focus { outline: none; }
 .edit-knob:focus-visible circle { stroke: var(--accent-cyan); stroke-width: 3; }
-.edit-ring-value {
+.edit-ring-value,
+.edit-ball-value {
   fill: var(--text-dim);
   font-size: 10px;
   font-weight: 600;

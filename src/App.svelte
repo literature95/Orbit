@@ -1,16 +1,24 @@
-﻿<script lang="ts">
+<script lang="ts">
   import { isTauri } from '@tauri-apps/api/core';
   import { emit, listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import type { BindingEvent } from '../crates/orbit-core/bindings/BindingEvent';
+  import type { Modifier } from '../crates/orbit-core/bindings/Modifier';
   import type { DashInfo } from '../crates/orbit-core/bindings/DashInfo';
+  import type { KbReplayResult } from '../crates/orbit-core/bindings/KbReplayResult';
+  import type { KbRecordStateEvent } from '../crates/orbit-core/bindings/KbRecordStateEvent';
+  import type { RecordingItem } from '../crates/orbit-core/bindings/RecordingItem';
   import type { DockPosition } from '../crates/orbit-core/bindings/DockPosition';
   import type { OcrResult } from '../crates/orbit-core/bindings/OcrResult';
   import type { OverlaySnapshot } from '../crates/orbit-core/bindings/OverlaySnapshot';
   import type { RecordStateEvent } from '../crates/orbit-core/bindings/RecordStateEvent';
   import type { RecoveryItem } from '../crates/orbit-core/bindings/RecoveryItem';
   import type { RegionSelectionStart } from '../crates/orbit-core/bindings/RegionSelectionStart';
+  import type { RemoteEndpoint } from '../crates/orbit-core/bindings/RemoteEndpoint';
+  import type { RemoteScreenshotResult } from '../crates/orbit-core/bindings/RemoteScreenshotResult';
+  import type { RemoteStatus } from '../crates/orbit-core/bindings/RemoteStatus';
   import type { SetupResult } from '../crates/orbit-core/bindings/SetupResult';
   import type { WindowLayout } from '../crates/orbit-core/bindings/WindowLayout';
   import type { WindowSize } from '../crates/orbit-core/bindings/WindowSize';
@@ -30,7 +38,14 @@
   let dockPosition: DockPosition = 'floating';
   let panelOpen = false;
   let setupRunning = false;
+  let replayRunning = false;
   let captureRunning = false;
+  let remoteStatus: RemoteStatus = { running: false, endpoint: null, activeSessions: 0 };
+  let remoteToken = '';
+  let remoteEndpointInput = '';
+  let remoteTokenInput = '';
+  let remoteBusy = false;
+  let remoteResult = '';
   let autostartConfigured = false;
   let setupAttempted = false;
   let permissionStates: SetupResult['permissions'] = {};
@@ -66,18 +81,23 @@
   // ============ 圆盘几何 ============
   // 展开窗口尺寸由 overlay.layout 下发；viewBox 固定 340×340 作为几何基准坐标系，
   // SVG 容器随窗口 100% 缩放，配置尺寸变化时圆盘自动等比映射，无需改写半径常量。
-  // 悬浮球半径 = 41px（orb-button 宽 82px 的一半）
-  // 内圆 / 外圆半径可在编辑页拖动，范围受窗口与最小扇区宽度约束
+  // 悬浮球半径：默认 41px（直径 82px），编辑页可拖动调整，全局（含折叠态）统一。
+  // 三层圆是包含关系：球 + BALL_GAP ≤ 内圆，内圆 + MIN_RING_WIDTH ≤ 外圆 ≤ R_OUT_MAX。
+  // 放宽人为天花板：球可到 136、外圈可到 166（窗口 340 的物理极限附近）。
+  // 拖动时联动撑开：球变大顶到内圆则撑大内圆，内圆顶到外圈则撑大外圈，永不卡手。
   const VIEW = 340;
   const DCX = VIEW / 2, DCY = VIEW / 2;
-  const ORB_RADIUS = 41;
-  const R_IN_MIN = ORB_RADIUS + 3;  // 44
-  const R_IN_MAX = 80;
-  const R_OUT_MIN = 96;
-  const R_OUT_MAX = VIEW / 2 - 38;  // 132 — 给顶部提示与底部按钮留出空位
-  const MIN_RING_WIDTH = 26;
-  const DEFAULT_DISC_GEOMETRY = { rIn: ORB_RADIUS + 6, rOut: 112 };
+  const DEFAULT_BALL_RADIUS = 41;
+  const BALL_RADIUS_MIN = 24;
+  const BALL_RADIUS_MAX = 136;       // 受外圈动态约束，实际有效期由 applyRingRadius 决定
+  const BALL_GAP = 3;                // 球与扇区内圆的最小间隙
+  const R_IN_MAX = 148;              // = R_OUT_MAX - MIN_RING_WIDTH，保证外圈总能撑出环宽
+  const R_OUT_MIN = 60;
+  const R_OUT_MAX = VIEW / 2 - 4;    // 166 — 贴近窗口物理极限
+  const MIN_RING_WIDTH = 18;
+  const DEFAULT_DISC_GEOMETRY = { rIn: DEFAULT_BALL_RADIUS + 6, rOut: 112 };
   const DISC_GEOMETRY_KEY = 'orbit.discGeometry';
+  const BALL_RADIUS_KEY = 'orbit.ballRadius';
   const GAP = 2.0 * Math.PI / 180;
 
   function pt(r: number, a: number): [number, number] {
@@ -141,41 +161,63 @@
     }
   }
 
-  function sanitizeDiscGeometry(value: unknown): { rIn: number; rOut: number } | null {
+  function clampBallRadius(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_BALL_RADIUS;
+    return Math.min(BALL_RADIUS_MAX, Math.max(BALL_RADIUS_MIN, Math.round(value)));
+  }
+
+  function rInMinFor(ballRadius: number): number {
+    return ballRadius + BALL_GAP;
+  }
+
+  function sanitizeDiscGeometry(value: unknown, ballRadius: number): { rIn: number; rOut: number } | null {
     if (!value || typeof value !== 'object') return null;
     const { rIn, rOut } = value as Record<string, unknown>;
     if (typeof rIn !== 'number' || typeof rOut !== 'number') return null;
     if (!Number.isFinite(rIn) || !Number.isFinite(rOut)) return null;
-    const safeIn = Math.min(R_IN_MAX, Math.max(R_IN_MIN, Math.round(rIn)));
-    const safeOut = Math.min(R_OUT_MAX, Math.max(R_OUT_MIN, Math.round(rOut)));
-    if (safeOut - safeIn < MIN_RING_WIDTH) return null;
+    // 联动撑开：内圆至少包住球，外圆至少留出环宽；被顶到时向外撑开而非丢弃存档。
+    const safeIn = Math.min(R_IN_MAX, Math.max(rInMinFor(ballRadius), Math.round(rIn)));
+    const safeOut = Math.min(R_OUT_MAX, Math.max(R_OUT_MIN, Math.round(rOut), safeIn + MIN_RING_WIDTH));
     return { rIn: safeIn, rOut: safeOut };
   }
 
-  function loadDiscGeometry(): { rIn: number; rOut: number } {
+  function loadBallRadius(): number {
+    try {
+      const raw = localStorage.getItem(BALL_RADIUS_KEY);
+      if (!raw) return DEFAULT_BALL_RADIUS;
+      return clampBallRadius(JSON.parse(raw));
+    } catch {
+      return DEFAULT_BALL_RADIUS;
+    }
+  }
+
+  function loadDiscGeometry(ballRadius: number): { rIn: number; rOut: number } {
     try {
       const raw = localStorage.getItem(DISC_GEOMETRY_KEY);
-      if (!raw) return { ...DEFAULT_DISC_GEOMETRY };
-      return sanitizeDiscGeometry(JSON.parse(raw)) ?? { ...DEFAULT_DISC_GEOMETRY };
+      if (!raw) return sanitizeDiscGeometry({ ...DEFAULT_DISC_GEOMETRY }, ballRadius) ?? { ...DEFAULT_DISC_GEOMETRY };
+      return sanitizeDiscGeometry(JSON.parse(raw), ballRadius) ?? sanitizeDiscGeometry({ ...DEFAULT_DISC_GEOMETRY }, ballRadius) ?? { ...DEFAULT_DISC_GEOMETRY };
     } catch {
       return { ...DEFAULT_DISC_GEOMETRY };
     }
   }
 
   let discLayout: string[] = loadDiscLayout();
-  let discGeometry = loadDiscGeometry();
+  let ballRadius = loadBallRadius();
+  let discGeometry = loadDiscGeometry(ballRadius);
   let draftGeometry = { ...discGeometry };
+  let draftBallRadius = ballRadius;
   let settingsOpen = false;
   let editMode = false;
   let draftLayout: string[] = [];
   let trayOpen = false;
   let discSvg: SVGSVGElement | null = null;
   let editDrag: { pointerId: number; index: number; startX: number; startY: number; active: boolean } | null = null;
-  let resizeDrag: { pointerId: number; kind: 'inner' | 'outer' } | null = null;
+  let resizeDrag: { pointerId: number; kind: 'inner' | 'outer' | 'ball' } | null = null;
   let editTarget = -1;
   let editRemove = false;
   $: viewRIn = editMode ? draftGeometry.rIn : discGeometry.rIn;
   $: viewROut = editMode ? draftGeometry.rOut : discGeometry.rOut;
+  $: viewBallRadius = editMode ? draftBallRadius : ballRadius;
 
   $: discActions = discLayout
     .map((id) => ACTION_MAP.get(id))
@@ -386,14 +428,48 @@
   }
 
   let kbRecording = false;
+  let mouseBusy = false;
   async function toggleKbRecord() {
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
     if (!kbRecording) {
-      try { await runCommand('kb_record.start'); kbRecording = true; notice = '🎮 键鼠录制中…再次点击扇区停止并保存'; }
+      try { await runCommand('kb_record.start'); notice = '🎮 键鼠录制中…再次点击扇区停止并保存'; }
       catch (e) { notice = `录制启动失败：${String(e)}`; }
     } else {
-      try { await runCommand('kb_record.stop'); kbRecording = false; notice = '🎮 录制已停止并保存到本地'; }
+      try { await runCommand('kb_record.stop'); notice = '🎮 录制已停止并保存到本地'; }
       catch (e) { notice = `停止失败：${String(e)}`; }
+    }
+    // kbRecording 以 kb-record-state 事件回填为准，避免与后端状态漂移。
+  }
+
+  function handleKbRecordState(state: KbRecordStateEvent): void {
+    kbRecording = state.active;
+    if (state.active) {
+      notice = '🎮 键鼠录制中…敏感窗口下的按键会自动跳过';
+    } else if (state.redactedCount > 0) {
+      notice = `🎮 录制已停止并保存；敏感窗口下跳过 ${state.redactedCount} 次按键`;
+    } else {
+      notice = '🎮 录制已停止并保存到本地';
+    }
+  }
+
+  /// 本地鼠标控制演示：移动指针到屏幕中部并单击一次。
+  /// 只走 input.mouse 命令，不涉及网络；让 demo 可被实际看见。
+  async function runMouseDemo(): Promise<void> {
+    if (!desktopBridgeAvailable) { notice = '请在桌面端使用鼠标控制。'; return; }
+    if (mouseBusy) return;
+    mouseBusy = true;
+    notice = '🖱 鼠标控制演示中…';
+    try {
+      const info = await runCommand<{ screenWidth: number; screenHeight: number }>('system.info');
+      const x = Math.round(info.screenWidth / 2);
+      const y = Math.round(info.screenHeight / 2);
+      await runCommand('input.mouse', { action: 'move', x, y });
+      await runCommand('input.mouse', { action: 'click', button: 'Left', count: 1 });
+      notice = `🖱 已将指针移至 (${x}, ${y}) 并单击一次`;
+    } catch (error) {
+      notice = `鼠标控制失败：${String(error)}`;
+    } finally {
+      mouseBusy = false;
     }
   }
 
@@ -507,6 +583,7 @@
     // 剪贴板窗口由 ClipboardPanel 自行接管，不注册悬浮层事件与仪表盘轮询
     if (isClipboardWindow) return;
 
+    void refreshRemoteStatus();
     pollDashInfo();
     dashPollTimer = setInterval(pollDashInfo, 2000);
     clockNow = formatClock();
@@ -563,6 +640,13 @@
       listen<RecordStateEvent>('record-state', ({ payload }) => {
         handleRecordState(payload);
       }),
+      listen<KbRecordStateEvent>('kb-record-state', ({ payload }) => {
+        handleKbRecordState(payload);
+      }),
+      listen<RemoteStatus>('remote://state', ({ payload }) => {
+        remoteStatus = payload;
+        if (!payload.running) remoteToken = '';
+      }),
       getCurrentWindow().onMoved(() => {
         if (moveTimer) clearTimeout(moveTimer);
         moveTimer = setTimeout(() => {
@@ -596,6 +680,8 @@
           .then((layout) => {
             dockPosition = layout.dock;
             panelOpen = layout.expanded;
+            // 启动时把本地保存的球半径同步给主进程，折叠态窗口据此定尺寸。
+            return runCommand('overlay.set_ball_radius', { radius: ballRadius });
           })
           .catch((error: unknown) => {
             notice = `悬浮球位置初始化失败：${String(error)}`;
@@ -631,6 +717,83 @@
     }
   }
 
+  // ============ 远程只读服务（回环 + 一次性令牌） ============
+  async function refreshRemoteStatus(): Promise<void> {
+    if (!desktopBridgeAvailable) return;
+    try {
+      remoteStatus = await runCommand<RemoteStatus>('remote.status');
+      if (!remoteStatus.running) remoteToken = '';
+    } catch {
+      // 状态查询失败不覆盖本地 UI，避免把临时错误当成服务已停止
+    }
+  }
+
+  async function toggleRemote(): Promise<void> {
+    if (!desktopBridgeAvailable) return;
+    try {
+      if (remoteStatus.running) {
+        await runCommand<boolean>('remote.serve.stop');
+        remoteStatus = { running: false, endpoint: null, activeSessions: 0 };
+        remoteToken = '';
+        remoteResult = '';
+        notice = '远程只读服务已停止，配对令牌已失效。';
+      } else {
+        const endpoint = await runCommand<RemoteEndpoint>('remote.serve.start', {});
+        remoteToken = endpoint.token;
+        remoteEndpointInput = `${endpoint.host}:${endpoint.port}`;
+        remoteTokenInput = endpoint.token;
+        remoteStatus = { running: true, endpoint: `${endpoint.host}:${endpoint.port}`, activeSessions: 0 };
+        notice = `远程只读服务已启动：${endpoint.host}:${endpoint.port}`;
+      }
+    } catch (error) {
+      notice = `远程只读服务操作失败：${String(error)}`;
+    }
+  }
+
+  function remoteParams(): { endpoint: string; token: string; monitorId: null } | null {
+    const endpoint = remoteEndpointInput.trim();
+    const token = remoteTokenInput.trim();
+    if (!endpoint || !token) {
+      notice = '请先填写对方端点与配对令牌。';
+      return null;
+    }
+    return { endpoint, token, monitorId: null };
+  }
+
+  async function remoteScreenshot(): Promise<void> {
+    const params = remoteParams();
+    if (!params || remoteBusy) return;
+    remoteBusy = true;
+    remoteResult = '';
+    try {
+      const result = await runCommand<RemoteScreenshotResult>('remote.screenshot', params);
+      remoteResult = `远程截图已复制到本机剪贴板：${result.width}×${result.height}`;
+      notice = remoteResult;
+    } catch (error) {
+      remoteResult = `远程截图失败：${String(error)}`;
+      notice = remoteResult;
+    } finally {
+      remoteBusy = false;
+    }
+  }
+
+  async function remoteOcr(): Promise<void> {
+    const params = remoteParams();
+    if (!params || remoteBusy) return;
+    remoteBusy = true;
+    remoteResult = '';
+    try {
+      const result = await runCommand<OcrResult>('remote.ocr', params);
+      remoteResult = result.text.trim() || '远程 OCR 未识别到文字。';
+      notice = '远程 OCR 完成。';
+    } catch (error) {
+      remoteResult = `远程 OCR 失败：${String(error)}`;
+      notice = remoteResult;
+    } finally {
+      remoteBusy = false;
+    }
+  }
+
   async function openSettings(): Promise<void> {
     try {
       await setPanelOpen(true);
@@ -644,6 +807,7 @@
   function startEdit(): void {
     draftLayout = [...discLayout];
     draftGeometry = { ...discGeometry };
+    draftBallRadius = ballRadius;
     editMode = true;
     trayOpen = false;
     editDrag = null;
@@ -666,12 +830,25 @@
   function saveEdit(): void {
     const next = sanitizeDiscLayout(draftLayout);
     if (!next) return;
+    const nextBall = clampBallRadius(draftBallRadius);
+    // 用统一的联动校正：内圆包住球、外圈留出环宽，避免两套逻辑漂移。
+    const adjusted = sanitizeDiscGeometry(draftGeometry, nextBall) ?? {
+      rIn: rInMinFor(nextBall),
+      rOut: Math.min(R_OUT_MAX, rInMinFor(nextBall) + MIN_RING_WIDTH),
+    };
     discLayout = next;
-    discGeometry = { ...draftGeometry };
+    ballRadius = nextBall;
+    discGeometry = adjusted;
     try {
       localStorage.setItem(DISC_LAYOUT_KEY, JSON.stringify(next));
-      localStorage.setItem(DISC_GEOMETRY_KEY, JSON.stringify(draftGeometry));
+      localStorage.setItem(BALL_RADIUS_KEY, JSON.stringify(nextBall));
+      localStorage.setItem(DISC_GEOMETRY_KEY, JSON.stringify(adjusted));
     } catch { /* ignore */ }
+    // 同步到主进程：折叠态窗口边长随球直径变化。失败不阻断本地保存。
+    if (desktopBridgeAvailable) {
+      void runCommand('overlay.set_ball_radius', { radius: nextBall })
+        .catch((error: unknown) => { notice = `球半径已保存，但窗口尺寸同步失败：${String(error)}`; });
+    }
     editMode = false;
     settingsOpen = false;
     trayOpen = false;
@@ -684,6 +861,7 @@
 
   function restoreDefaultLayout(): void {
     draftLayout = [...DEFAULT_DISC_LAYOUT];
+    draftBallRadius = DEFAULT_BALL_RADIUS;
     draftGeometry = { ...DEFAULT_DISC_GEOMETRY };
     trayOpen = false;
   }
@@ -762,7 +940,9 @@
     draftLayout = next;
   }
 
-  function resizePointerDown(event: PointerEvent, kind: 'inner' | 'outer'): void {
+  type ResizeKind = 'inner' | 'outer' | 'ball';
+
+  function resizePointerDown(event: PointerEvent, kind: ResizeKind): void {
     event.stopPropagation();
     resizeDrag = { pointerId: event.pointerId, kind };
     editRemove = false;
@@ -770,14 +950,28 @@
     try { discSvg?.setPointerCapture(event.pointerId); } catch { /* 指针已失效时忽略 */ }
   }
 
-  function applyRingRadius(kind: 'inner' | 'outer', distance: number): void {
-    if (kind === 'inner') {
-      const upper = Math.min(R_IN_MAX, draftGeometry.rOut - MIN_RING_WIDTH);
-      const value = Math.min(upper, Math.max(R_IN_MIN, Math.round(distance)));
-      draftGeometry = { ...draftGeometry, rIn: value };
+  function applyRingRadius(kind: ResizeKind, distance: number): void {
+    const rounded = Math.round(distance);
+    if (kind === 'ball') {
+      // 球可在物理极限内自由放大；顶到内圆时把内圆（必要时连同外圈）向外撑开。
+      const ball = Math.min(BALL_RADIUS_MAX, Math.max(BALL_RADIUS_MIN, rounded));
+      const minIn = rInMinFor(ball);
+      let rIn = Math.max(draftGeometry.rIn, minIn);
+      let rOut = draftGeometry.rOut;
+      if (rOut - rIn < MIN_RING_WIDTH) rOut = Math.min(R_OUT_MAX, rIn + MIN_RING_WIDTH);
+      if (rOut - rIn < MIN_RING_WIDTH) rIn = Math.max(BALL_RADIUS_MIN, rOut - MIN_RING_WIDTH);
+      draftBallRadius = ball;
+      draftGeometry = { rIn, rOut };
+    } else if (kind === 'inner') {
+      // 内圆顶到外圈时把外圈撑开；下限始终包住球。
+      const lower = rInMinFor(draftBallRadius);
+      const rIn = Math.min(R_IN_MAX, Math.max(lower, rounded));
+      const rOut = Math.min(R_OUT_MAX, Math.max(draftGeometry.rOut, rIn + MIN_RING_WIDTH));
+      draftGeometry = { rIn, rOut };
     } else {
-      const lower = Math.max(R_OUT_MIN, draftGeometry.rIn + MIN_RING_WIDTH);
-      const value = Math.max(lower, Math.min(R_OUT_MAX, Math.round(distance)));
+      // 外圈下限：既不高于内圆+环宽，也不小于球+间隙+环宽；物理上限 R_OUT_MAX。
+      const lower = Math.max(R_OUT_MIN, draftGeometry.rIn + MIN_RING_WIDTH, rInMinFor(draftBallRadius) + MIN_RING_WIDTH);
+      const value = Math.max(lower, Math.min(R_OUT_MAX, rounded));
       draftGeometry = { ...draftGeometry, rOut: value };
     }
   }
@@ -789,11 +983,11 @@
     applyRingRadius(resizeDrag.kind, info.distance);
   }
 
-  function resizeKeydown(event: KeyboardEvent, kind: 'inner' | 'outer'): void {
+  function resizeKeydown(event: KeyboardEvent, kind: ResizeKind): void {
     if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
     event.preventDefault();
     event.stopPropagation();
-    const base = kind === 'inner' ? draftGeometry.rIn : draftGeometry.rOut;
+    const base = kind === 'ball' ? draftBallRadius : kind === 'inner' ? draftGeometry.rIn : draftGeometry.rOut;
     applyRingRadius(kind, base + (event.key === 'ArrowUp' ? 2 : -2));
   }
 
@@ -806,6 +1000,34 @@
       await runCommand('app.quit');
     } catch (error) {
       notice = `退出失败：${String(error)}`;
+    }
+  }
+
+  /// 回放最近一次键鼠录制：列表 → 取最新 → 交给 Rust 排程回放并报告漂移（P-09）。
+  async function replayLatestRecording(): Promise<void> {
+    if (!desktopBridgeAvailable) {
+      notice = '浏览器预览无法回放键鼠录制。';
+      return;
+    }
+    if (replayRunning) return;
+    replayRunning = true;
+    notice = '';
+    try {
+      const recordings = await runCommand<RecordingItem[]>('kb_record.list');
+      if (recordings.length === 0) {
+        notice = '还没有已保存的键鼠录制：先录制一次，再回放。';
+        return;
+      }
+      const latest = recordings[0];
+      const result = await runCommand<KbReplayResult>('kb.replay', {
+        recordingId: latest.id,
+        speed: 1,
+      });
+      notice = `已回放 ${result.eventCount} 个事件，耗时 ${result.elapsedMs} ms（漂移 ${result.driftMs} ms）。`;
+    } catch (error) {
+      notice = `回放失败：${String(error)}`;
+    } finally {
+      replayRunning = false;
     }
   }
 
@@ -1064,7 +1286,42 @@
       await cancelRegionScreenshot();
       return;
     }
+    // 事件绑定优先：用户给右键绑定了动作时不再打开设置。
+    if (await dispatchBinding('right-click', event)) {
+      return;
+    }
     await openSettings();
+  }
+
+  /// 把修饰键状态归一化为契约里的 Modifier 字符串（ctrl+alt+shift 固定顺序）。
+  function modifierOf(event: { ctrlKey: boolean; altKey: boolean; shiftKey: boolean }): Modifier {
+    const parts: string[] = [];
+    if (event.ctrlKey) parts.push('ctrl');
+    if (event.altKey) parts.push('alt');
+    if (event.shiftKey) parts.push('shift');
+    return (parts.length > 0 ? parts.join('+') : 'none') as Modifier;
+  }
+
+  /// 转发事件到绑定层；返回 true 表示命中绑定并已执行。
+  async function dispatchBinding(event: BindingEvent, source: MouseEvent | WheelEvent): Promise<boolean> {
+    try {
+      const result = await runCommand<unknown>('binding.dispatch', {
+        event,
+        modifier: modifierOf(source),
+      });
+      return result !== null && result !== undefined;
+    } catch (error) {
+      notice = `事件绑定执行失败：${String(error)}`;
+      return false;
+    }
+  }
+
+  async function handleWheel(event: WheelEvent): Promise<void> {
+    if (isClipboardWindow || event.deltaY === 0) return;
+    const bindingEvent: BindingEvent = event.deltaY < 0 ? 'wheel-up' : 'wheel-down';
+    if (await dispatchBinding(bindingEvent, event)) {
+      event.preventDefault();
+    }
   }
 
   async function closePanel(): Promise<void> {
@@ -1077,6 +1334,7 @@
 
   // 剪贴板窗口不参与悬浮球交互，避免全局拖拽 / 右键菜单干扰面板
   const mainContextMenu = (event: MouseEvent) => { if (!isClipboardWindow) void handleContextMenu(event); };
+  const mainWheel = (event: WheelEvent) => { void handleWheel(event); };
   const mainPointerMove = (event: PointerEvent) => { if (!isClipboardWindow) handlePointerMove(event); };
   const mainPointerUp = (event: PointerEvent) => { if (!isClipboardWindow) handlePointerUp(event); };
   const mainKeyDown = (event: KeyboardEvent) => { if (!isClipboardWindow) handleKeyDown(event); };
@@ -1089,6 +1347,7 @@
 
 <svelte:window
   oncontextmenu={mainContextMenu}
+  onwheel={mainWheel}
   onpointermove={mainPointerMove}
   onpointerup={mainPointerUp}
   onpointercancel={mainPointerUp}
@@ -1128,7 +1387,11 @@
   class:left-docked={dockPosition === 'left'}
   class:right-docked={dockPosition === 'right'}
   class="app-shell"
+  style:--orb-size={`${viewBallRadius * 2}px`}
 >
+  {#if remoteStatus.running}
+    <div class="remote-badge" title={`远程只读服务运行中：${remoteStatus.endpoint ?? ''}`} aria-label="远程只读服务运行中">R</div>
+  {/if}
   {#if recordingActive}
     <div class="rec-control">
       <span class="rec-timer">{formatRecTime(recordElapsedMs)}</span>
@@ -1145,8 +1408,22 @@
         {notice}
         layoutCount={discLayout.length}
         recordDir={recordDir}
+        replayRunning={replayRunning}
+        mouseBusy={mouseBusy}
+        remoteRunning={remoteStatus.running}
+        remoteEndpoint={remoteStatus.endpoint ?? ''}
+        remoteToken={remoteToken}
+        remoteResult={remoteResult}
+        remoteBusy={remoteBusy}
+        bind:remoteEndpointInput
+        bind:remoteTokenInput
+        onremotetoggle={() => void toggleRemote()}
+        onremotescreenshot={() => void remoteScreenshot()}
+        onremoteocr={() => void remoteOcr()}
         onpickrecorddir={pickRecordDir}
         onclearrecorddir={clearRecordDir}
+        onreplayrecording={() => void replayLatestRecording()}
+        onmousedemo={() => void runMouseDemo()}
         onedit={startEdit}
         ontoggleautostart={() => void toggleAutostart()}
         onquit={() => void quitApp()}
@@ -1205,8 +1482,23 @@
           class="edit-knob"
           role="slider"
           tabindex="0"
+          aria-label="中心球大小"
+          aria-valuemin={BALL_RADIUS_MIN}
+          aria-valuemax={Math.min(BALL_RADIUS_MAX, viewRIn - BALL_GAP)}
+          aria-valuenow={Math.round(viewBallRadius)}
+          onpointerdown={(e) => resizePointerDown(e, 'ball')}
+          onkeydown={(e) => resizeKeydown(e, 'ball')}
+        >
+          <circle cx={DCX - viewBallRadius * 0.707} cy={DCY + viewBallRadius * 0.707} r="7" />
+          <title>拖动或按 ↑↓ 调整中心球大小</title>
+        </g>
+        <text class="edit-ball-value" x={DCX - viewBallRadius * 0.707 - 12} y={DCY + viewBallRadius * 0.707} dominant-baseline="middle" text-anchor="end">{Math.round(viewBallRadius)}</text>
+        <g
+          class="edit-knob"
+          role="slider"
+          tabindex="0"
           aria-label="内圆大小"
-          aria-valuemin={R_IN_MIN}
+          aria-valuemin={rInMinFor(viewBallRadius)}
           aria-valuemax={R_IN_MAX}
           aria-valuenow={Math.round(viewRIn)}
           onpointerdown={(e) => resizePointerDown(e, 'inner')}
@@ -1275,6 +1567,7 @@
         {editRemove ? '松手删除该扇区' : `拖动排序 · 拖到中心或拖出圆盘删除 · ${draftLayout.length} 项`}
       </p>
       <div class="edit-bar">
+        <button class="settings-btn ghost" type="button" onclick={toggleTray}>+ 添加功能</button>
         <button class="settings-btn ghost" type="button" onclick={restoreDefaultLayout}>恢复默认</button>
         <button class="settings-btn" type="button" onclick={cancelEdit}>取消</button>
         <button class="settings-btn primary" type="button" onclick={saveEdit}>保存</button>

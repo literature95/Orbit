@@ -11,11 +11,13 @@ use crate::{
     elevated, layout_config, screenshot, set_overlay_layout, setup_result,
 };
 use orbit_core::{
-    AuditLog, CommandRequest, CommandResponse, CommandSpec, CommandStatus, DashInfo, EmptyParams,
-    ClipFlagParams, ClipIdParams, ClipListParams, ClipMonitorParams, ClipWriteParams,
-    ConvertFormatParams, MonitorSnapshot, OcrImageParams, OverlaySnapshot, RecordStartParams,
-    RegionFinishParams, ScreenshotRequest, SetAutostartParams, SetElevatedParams,
-    SetOverlayOpenParams, SystemInfo, command_catalog, event_catalog,
+    AuditLog, CommandRequest, CommandResponse, CommandSpec, CommandStatus, DashInfo, EmptyParams, ClipFlagParams, ClipIdParams, ClipListParams, ClipMonitorParams, ClipWriteParams,
+    ConvertFormatParams, EventBindingKeyParams, InputMouseParams, MonitorSnapshot, OcrImageParams,
+    OrbitError, OverlaySnapshot, RecordStartParams, RegionFinishParams, RemoteRequestParams, RemoteStartParams,
+    RemoveShortcutParams, ScreenshotRequest, SetAutostartParams, SetBallRadiusParams,
+    SetElevatedParams, SetOverlayOpenParams, SystemInfo, UpsertEventBindingParams,
+    UpsertShortcutParams,
+    command_catalog, event_catalog,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -32,7 +34,7 @@ pub struct CommandCtx {
     pub app: AppHandle,
 }
 
-pub type BoxFut = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+pub type BoxFut = Pin<Box<dyn Future<Output = Result<Value, OrbitError>> + Send>>;
 
 pub struct BusCommand {
     pub spec: CommandSpec,
@@ -40,10 +42,13 @@ pub struct BusCommand {
 }
 
 /// 同步处理器包装：放入阻塞线程池执行，避免长任务卡住异步执行器。
-fn sync<F, T>(f: F) -> Arc<dyn Fn(CommandCtx, Value) -> BoxFut + Send + Sync>
+/// 处理器可返回任意 `Into<OrbitError>` 的错误类型：显式 `OrbitError`
+/// 会被保留分类，沿用 `String` 的存量 handler 自动归类为 `System`。
+fn sync<F, T, E>(f: F) -> Arc<dyn Fn(CommandCtx, Value) -> BoxFut + Send + Sync>
 where
-    F: Fn(CommandCtx, Value) -> Result<T, String> + Send + Sync + 'static,
+    F: Fn(CommandCtx, Value) -> Result<T, E> + Send + Sync + 'static,
     T: Serialize + Send + 'static,
+    E: Into<OrbitError> + Send + 'static,
 {
     let f = Arc::new(f);
     Arc::new(move |ctx, params| {
@@ -51,8 +56,11 @@ where
         Box::pin(async move {
             tauri::async_runtime::spawn_blocking(move || f(ctx, params))
                 .await
-                .map_err(|error| format!("命令工作线程异常退出：{error}"))?
-                .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
+                .map_err(|error| OrbitError::system(format!("命令工作线程异常退出：{error}")))?
+                .map_err(Into::into)
+                .and_then(|value| {
+                    serde_json::to_value(value).map_err(|error| OrbitError::system(error.to_string()))
+                })
         })
     })
 }
@@ -107,7 +115,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     sys.refresh_memory();
                     let os_version = sysinfo::System::kernel_version()
                         .unwrap_or_else(|| "unknown".to_string());
-                    Ok(SystemInfo {
+                    Ok::<_, OrbitError>(SystemInfo {
                         os_name: std::env::consts::OS.to_string(),
                         os_version,
                         screen_width: size.width,
@@ -144,7 +152,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     } else {
                         None
                     };
-                    Ok(DashInfo {
+                    Ok::<_, OrbitError>(DashInfo {
                         cpu_percent,
                         memory_used_percent: mem_percent,
                         memory_used_mb: used_mb,
@@ -187,7 +195,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     } else {
                         None
                     };
-                    Ok(MonitorSnapshot {
+                    Ok::<_, OrbitError>(MonitorSnapshot {
                         cpu_percent,
                         per_core,
                         memory_used_percent,
@@ -219,8 +227,8 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         layout.dock = dock;
                         layout.expanded = false;
                     }
-                    set_overlay_layout(&window, layout.dock, layout.expanded)?;
-                    Ok(OverlaySnapshot {
+                    set_overlay_layout(&window, layout.dock, layout.expanded, layout.ball_radius)?;
+                    Ok::<_, OrbitError>(OverlaySnapshot {
                         dock: layout.dock,
                         expanded: layout.expanded,
                     })
@@ -241,9 +249,23 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
                     let state = ctx.app.state::<OverlayState>();
                     let mut layout = state.0.lock().map_err(|error| error.to_string())?;
-                    set_overlay_layout(&window, layout.dock, open)?;
+                    set_overlay_layout(&window, layout.dock, open, layout.ball_radius)?;
                     layout.expanded = open;
-                    Ok(Value::Null)
+                    Ok::<_, OrbitError>(Value::Null)
+                }),
+            },
+        );
+
+        map.insert(
+            "overlay.set_ball_radius",
+            BusCommand {
+                spec: catalog_spec(&catalog, "overlay.set_ball_radius"),
+                run: sync(|ctx, params| {
+                    let SetBallRadiusParams { radius } = serde_json::from_value(params)
+                        .map_err(|error| OrbitError::param(format!("参数不合法：{error}")))?;
+                    crate::set_ball_radius_impl(&ctx.app, radius)
+                        .map_err(OrbitError::system)?;
+                    Ok::<_, OrbitError>(Value::Null)
                 }),
             },
         );
@@ -304,7 +326,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     let _: EmptyParams =
                         serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
                     ctx.app.exit(0);
-                    Ok(Value::Null)
+                    Ok::<_, OrbitError>(Value::Null)
                 }),
             },
         );
@@ -346,7 +368,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     let _: EmptyParams =
                         serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
                     let state = clip_state(&ctx.app)?;
-                    Ok(clipboard::count(&state))
+                    Ok::<_, OrbitError>(clipboard::count(&state))
                 }),
             },
         );
@@ -372,7 +394,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     let _: EmptyParams =
                         serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
                     let state = clip_state(&ctx.app)?;
-                    Ok(clipboard::get_monitor(&state))
+                    Ok::<_, OrbitError>(clipboard::get_monitor(&state))
                 }),
             },
         );
@@ -381,10 +403,23 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
             "clipboard.shortcut",
             BusCommand {
                 spec: catalog_spec(&catalog, "clipboard.shortcut"),
-                run: sync(|_ctx, params| {
+                run: sync(|ctx, params| {
                     let _: EmptyParams =
                         serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
-                    Ok(clipboard::shortcut())
+                    // 标签跟随事件绑定配置；用户改掉快捷键后提示不会说谎。
+                    let accelerator = crate::bindings::list_impl(&ctx.app)
+                        .ok()
+                        .and_then(|config| {
+                            config.shortcuts.into_iter().find_map(|shortcut| {
+                                matches!(
+                                    shortcut.action,
+                                    orbit_core::BindingAction::Menu { ref menu } if menu == "clipboard"
+                                )
+                                .then_some(shortcut.accelerator)
+                            })
+                        })
+                        .unwrap_or_else(|| clipboard::CLIP_SHORTCUT.to_string());
+                    Ok::<_, OrbitError>(accelerator)
                 }),
             },
         );
@@ -449,7 +484,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                     let ClipMonitorParams { enabled } = serde_json::from_value(params)
                         .map_err(|error| format!("参数不合法：{error}"))?;
                     let state = clip_state(&ctx.app)?;
-                    Ok(clipboard::set_monitor(&state, enabled))
+                    Ok::<_, OrbitError>(clipboard::set_monitor(&state, enabled))
                 }),
             },
         );
@@ -549,7 +584,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         let _: EmptyParams = serde_json::from_value(params)
                             .map_err(|error| format!("参数不合法：{error}"))?;
                         let path = crate::record_stop_impl(&ctx.app).await?;
-                        serde_json::to_value(path).map_err(|error| error.to_string())
+                        serde_json::to_value(path).map_err(|error| OrbitError::system(error.to_string()))
                     })
                 }),
             },
@@ -592,7 +627,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                             .get_webview_window("main")
                             .ok_or_else(|| "找不到 Orbit 主窗口。".to_string())?;
                         let result = crate::ocr_current_screen_impl(&window).await?;
-                        serde_json::to_value(result).map_err(|error| error.to_string())
+                        serde_json::to_value(result).map_err(|error| OrbitError::system(error.to_string()))
                     })
                 }),
             },
@@ -623,6 +658,42 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
         );
 
         map.insert(
+            "kb_record.list",
+            BusCommand {
+                spec: catalog_spec(&catalog, "kb_record.list"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams =
+                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::kb_record_list_impl(&ctx.app)
+                }),
+            },
+        );
+
+        map.insert(
+            "kb.replay",
+            BusCommand {
+                spec: catalog_spec(&catalog, "kb.replay"),
+                run: sync(|ctx, params| {
+                    let params: orbit_core::KbReplayParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::kb_replay_impl(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "input.mouse",
+            BusCommand {
+                spec: catalog_spec(&catalog, "input.mouse"),
+                run: sync(|_ctx, params| {
+                    let params: InputMouseParams = serde_json::from_value(params)
+                        .map_err(|error| orbit_core::OrbitError::param(format!("参数不合法：{error}")))?;
+                    crate::input_mouse_impl(params)
+                }),
+            },
+        );
+
+        map.insert(
             "convert.format",
             BusCommand {
                 spec: catalog_spec(&catalog, "convert.format"),
@@ -637,7 +708,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         let output =
                             crate::convert_format_impl(&ctx.app, input_path, output_path, format)
                                 .await?;
-                        serde_json::to_value(output).map_err(|error| error.to_string())
+                        serde_json::to_value(output).map_err(|error| OrbitError::system(error.to_string()))
                     })
                 }),
             },
@@ -667,7 +738,7 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                         let layout = overlay_layout(&ctx.app)?;
                         let response =
                             crate::finish_region_selection_impl(&ctx.app, layout, params).await?;
-                        serde_json::to_value(response).map_err(|error| error.to_string())
+                        serde_json::to_value(response).map_err(|error| OrbitError::system(error.to_string()))
                     })
                 }),
             },
@@ -705,7 +776,141 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                 run: sync(|ctx, params| {
                     let _: EmptyParams =
                         serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
-                    Ok(crate::get_elevated_status_impl(&ctx.app))
+                    Ok::<_, OrbitError>(crate::get_elevated_status_impl(&ctx.app))
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.list",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.list"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams =
+                        serde_json::from_value(params).map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::bindings::list_impl(&ctx.app)
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.dispatch",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.dispatch"),
+                run: Arc::new(|ctx, params| {
+                    Box::pin(async move {
+                        let key: EventBindingKeyParams = serde_json::from_value(params)
+                            .map_err(|error| format!("参数不合法：{error}"))?;
+                        crate::bindings::dispatch_impl(&ctx.app, key).await
+                    })
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.upsert_event",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.upsert_event"),
+                run: sync(|ctx, params| {
+                    let params: UpsertEventBindingParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::bindings::upsert_event_impl(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.remove_event",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.remove_event"),
+                run: sync(|ctx, params| {
+                    let params: EventBindingKeyParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::bindings::remove_event_impl(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.upsert_shortcut",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.upsert_shortcut"),
+                run: sync(|ctx, params| {
+                    let params: UpsertShortcutParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::bindings::upsert_shortcut_impl(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "binding.remove_shortcut",
+            BusCommand {
+                spec: catalog_spec(&catalog, "binding.remove_shortcut"),
+                run: sync(|ctx, params| {
+                    let params: RemoveShortcutParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::bindings::remove_shortcut_impl(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "remote.serve.start",
+            BusCommand {
+                spec: catalog_spec(&catalog, "remote.serve.start"),
+                run: sync(|ctx, params| {
+                    let params: RemoteStartParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::remote::start_server(&ctx.app, params)
+                }),
+            },
+        );
+
+        map.insert(
+            "remote.serve.stop",
+            BusCommand {
+                spec: catalog_spec(&catalog, "remote.serve.stop"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::remote::stop_server(&ctx.app)
+                }),
+            },
+        );
+
+        map.insert(
+            "remote.status",
+            BusCommand {
+                spec: catalog_spec(&catalog, "remote.status"),
+                run: sync(|ctx, params| {
+                    let _: EmptyParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::remote::status(&ctx.app)
+                }),
+            },
+        );
+
+        map.insert(
+            "remote.screenshot",
+            BusCommand {
+                spec: catalog_spec(&catalog, "remote.screenshot"),
+                run: sync(|_ctx, params| {
+                    let params: RemoteRequestParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::remote::fetch_screenshot(params)
+                }),
+            },
+        );
+
+        map.insert(
+            "remote.ocr",
+            BusCommand {
+                spec: catalog_spec(&catalog, "remote.ocr"),
+                run: sync(|_ctx, params| {
+                    let params: RemoteRequestParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::remote::fetch_ocr(params)
                 }),
             },
         );
@@ -740,15 +945,21 @@ pub fn emit<T: Serialize + Clone>(app: &AppHandle, event_id: &str, payload: &T) 
 
 /// 命令总线唯一入口：路由 → 执行 → 异步审计 → 组装响应。
 ///
+/// `source` 标记调用来源（`orb` / `hotkey` / `mcp`），写入审计日志；
 /// 审计写入放入后台任务，不阻塞响应路径；写入失败只记录日志，
 /// 不再把审计失败上升为命令失败（避免可执行的命令被日志系统拖垮）。
-pub async fn execute(app: AppHandle, audit: AuditLog, request: CommandRequest) -> CommandResponse {
+pub async fn execute(
+    app: AppHandle,
+    audit: AuditLog,
+    request: CommandRequest,
+    source: &str,
+) -> CommandResponse {
     let started = Instant::now();
     let command_id = request.command_id.clone();
 
     let result = match registry().get(command_id.as_str()) {
         Some(entry) => (entry.run)(CommandCtx { app: app.clone() }, request.params.clone()).await,
-        None => Err(format!("未知命令：{command_id}")),
+        None => Err(OrbitError::not_found(format!("未知命令：{command_id}"))),
     };
     let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let status = if result.is_ok() {
@@ -761,22 +972,24 @@ pub async fn execute(app: AppHandle, audit: AuditLog, request: CommandRequest) -
         let audit = audit;
         let command_id = command_id.clone();
         let params = request.params.clone();
+        let source = source.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = audit.record(&command_id, &params, status, duration_ms) {
+            if let Err(error) = audit.record(&command_id, &params, status, duration_ms, &source) {
                 log::error!("审计写入失败（{command_id}）：{error}");
             }
         });
     }
 
-    let (data, error) = match result {
-        Ok(data) => (Some(data), None),
-        Err(error) => (None, Some(error)),
+    let (data, error, error_kind) = match result {
+        Ok(data) => (Some(data), None, None),
+        Err(error) => (None, Some(error.message), Some(error.kind)),
     };
     CommandResponse {
         command_id,
         status,
         data,
         error,
+        error_kind,
         duration_ms,
     }
 }

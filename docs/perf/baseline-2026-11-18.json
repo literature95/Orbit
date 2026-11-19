@@ -1,0 +1,36 @@
+﻿{
+    "generatedAt":  "2026-11-18T14:22:56.1031211+08:00",
+    "exe":  "D:\\Documents\\Desktop\\Orbit\\target\\release\\orbit-desktop.exe",
+    "exeBytes":  16089088,
+    "embeddedAssets":  true,
+    "os":  "Microsoft Windows NT 10.0.26200.0",
+    "machine":  "Ai202509201300K",
+    "iterations":  5,
+    "p01ColdStartMs":  {
+                           "p50":  344.4,
+                           "samples":  [
+                                           355.2,
+                                           326.6,
+                                           355.8,
+                                           341.8,
+                                           344.4
+                                       ],
+                           "target":  500,
+                           "p95":  355.8
+                       },
+    "p02IdleTreeMb":  {
+                          "p50":  553.4,
+                          "samples":  [
+                                          553.8,
+                                          553.1,
+                                          553.8,
+                                          553.2,
+                                          553.4
+                                      ],
+                          "target":  60,
+                          "p95":  553.8
+                      },
+    "failures":  [
+
+                 ]
+}

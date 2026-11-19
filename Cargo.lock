@@ -3242,8 +3242,10 @@ dependencies = [
  "base64 0.21.7",
  "clipboard-rs",
  "enigo",
+ "getrandom 0.3.4",
  "log",
  "orbit-core",
+ "orbit-ocr",
  "regex",
  "rusqlite",
  "serde",
@@ -3258,6 +3260,28 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-window-state",
  "windows 0.62.2",
+ "xcap",
+]
+
+[[package]]
+name = "orbit-ocr"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "orbit-core",
+ "serde_json",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "orbit-ocr-server"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "orbit-core",
+ "orbit-ocr",
+ "serde",
+ "serde_json",
  "xcap",
 ]
 

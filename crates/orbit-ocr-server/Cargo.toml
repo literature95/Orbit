@@ -1,0 +1,32 @@
+[package]
+name = "orbit-ocr-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Orbit 远程 OCR 服务端与客户端：客户端传图 → 服务端落盘 → OCR → 返回结果"
+
+[features]
+# 实机冒烟：真实启动服务端、上传真实截图并调用 Windows OCR。
+smoke = []
+
+[lib]
+name = "orbit_ocr_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orbit-ocr-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "orbit-ocr-client"
+path = "src/bin/orbit-ocr-client.rs"
+
+[dependencies]
+orbit-core = { version = "0.1.0", path = "../orbit-core" }
+orbit-ocr = { version = "0.1.0", path = "../orbit-ocr" }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+getrandom = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+xcap = "0.9.8"

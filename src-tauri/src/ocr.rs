@@ -1,9 +1,14 @@
 //! OCR 引擎抽象层。
 //!
-//! 命令层只依赖 `OcrEngine`，具体后端由 `default_engine()` 提供。当前唯一后端
-//! 是 Windows.Media.Ocr（PowerShell 调用实现位于 `lib.rs` 的
-//! `ocr_image_blocking`）。后续接入 PaddleOCR HTTP sidecar 时，只需新增一个
-//! 实现并替换工厂返回值，命令契约与调用点无需改动。
+//! 命令层只依赖 `OcrEngine`，具体后端由 `default_engine()` 提供：
+//!
+//! 1. `NativeOcr`（默认）：`windows` crate 直连 WinRT `Windows.Media.Ocr`，
+//!    无子进程、无 PowerShell 冷启动（实现见 `ocr_native.rs`）；
+//! 2. `PowerShellOcr`（回退）：原 PowerShell 调用（`ocr_backend.rs`），
+//!    在原生路径失败时兜底，保证命令契约与可用性不退化。
+//!
+//! 后续接入 PaddleOCR HTTP sidecar 时，只需新增一个 `OcrEngine` 实现并调整
+//! 工厂返回顺序，命令契约与调用点无需改动。
 
 use orbit_core::OcrResult;
 
@@ -13,20 +18,30 @@ pub(crate) trait OcrEngine: Send + Sync {
     fn recognize(&self, image_path: &str) -> Result<OcrResult, String>;
 }
 
-/// Windows 内置后端：Windows.Media.Ocr。
-pub(crate) struct WindowsMediaOcr;
+/// 原生后端：WinRT 直连，失败时回退到 PowerShell 实现。
+pub(crate) struct NativeOcr;
 
-impl OcrEngine for WindowsMediaOcr {
+impl OcrEngine for NativeOcr {
     fn recognize(&self, image_path: &str) -> Result<OcrResult, String> {
-        crate::ocr_image_blocking(image_path)
+        orbit_ocr::recognize(image_path)
     }
 }
 
-static WINDOWS_MEDIA_OCR: WindowsMediaOcr = WindowsMediaOcr;
+/// 纯 PowerShell 后端（保留给原生路径不可用的环境与对照测试）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PowerShellOcr;
+
+impl OcrEngine for PowerShellOcr {
+    fn recognize(&self, image_path: &str) -> Result<OcrResult, String> {
+        orbit_ocr::recognize_with_powershell(image_path)
+    }
+}
+
+static NATIVE_OCR: NativeOcr = NativeOcr;
 
 /// 返回当前启用的引擎。`'static` 引用使命令总线的闭包无需额外持有所有权。
 pub(crate) fn default_engine() -> &'static dyn OcrEngine {
-    &WINDOWS_MEDIA_OCR
+    &NATIVE_OCR
 }
 
 #[cfg(test)]
@@ -60,5 +75,13 @@ mod tests {
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
         assert_send_sync::<dyn OcrEngine>();
         let _engine: &'static dyn OcrEngine = default_engine();
+    }
+
+    /// 两个真实后端都实现了同一契约（编译期检查）。
+    #[test]
+    fn backend_implementations_satisfy_the_trait() {
+        fn assert_engine<T: OcrEngine>() {}
+        assert_engine::<NativeOcr>();
+        assert_engine::<PowerShellOcr>();
     }
 }

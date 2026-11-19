@@ -1,0 +1,18 @@
+[package]
+name = "orbit-ocr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Orbit 共享 OCR 引擎：Windows.Media.Ocr 原生实现 + PowerShell 回退"
+
+[features]
+# 实机冒烟：真实调用 Windows OCR 组件与 PowerShell。
+smoke = []
+
+[dependencies]
+orbit-core = { version = "0.1.0", path = "../orbit-core" }
+serde_json = "1.0"
+log = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_WinRT", "Foundation", "Foundation_Collections", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams"] }

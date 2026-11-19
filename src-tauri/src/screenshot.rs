@@ -6,16 +6,23 @@ use xcap::{Monitor, image::RgbaImage};
 
 const MAX_CAPTURE_PIXELS: u64 = 64 * 1024 * 1024;
 
-pub fn capture_to_clipboard(request: ScreenshotRequest) -> Result<serde_json::Value, String> {
+/// 抓取原始 RGBA 图像，供本地截图与远程只读服务共用。
+pub(crate) fn capture_image(
+    request: ScreenshotRequest,
+) -> Result<(RgbaImage, usize), String> {
     let monitors = Monitor::all().map_err(|error| error.to_string())?;
     if monitors.is_empty() {
         return Err("系统未检测到可截图的显示器。".to_string());
     }
 
-    let (image, monitor_count) = match request.mode {
-        ScreenshotMode::Fullscreen => capture_fullscreen(&monitors, request.monitor_id)?,
-        ScreenshotMode::Region => (capture_region(&monitors, &request)?, 1),
-    };
+    match request.mode {
+        ScreenshotMode::Fullscreen => capture_fullscreen(&monitors, request.monitor_id),
+        ScreenshotMode::Region => Ok((capture_region(&monitors, &request)?, 1)),
+    }
+}
+
+pub fn capture_to_clipboard(request: ScreenshotRequest) -> Result<serde_json::Value, String> {
+    let (image, monitor_count) = capture_image(request)?;
     let width = image.width();
     let height = image.height();
     let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;

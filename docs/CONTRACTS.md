@@ -12,6 +12,7 @@ The shared command types live in `crates/orbit-core`. TypeScript bindings are ge
 | `system.monitor` | ReadOnly | `EmptyParams` (`{}`) | `MonitorSnapshot`: total/per-core CPU, memory, uptime, temperature |
 | `overlay.dock` | Mutating (moves/resizes window) | `EmptyParams` (`{}`) | `OverlaySnapshot`: dock edge and expanded state |
 | `overlay.set_open` | Mutating | `SetOverlayOpenParams` (`{ open }`) | `null` |
+| `overlay.set_ball_radius` | Mutating (resizes floating window) | `SetBallRadiusParams` (`{ radius }`) | `null` |
 | `overlay.layout` | ReadOnly | `EmptyParams` (`{}`) | `WindowLayout`: all window/panel sizes in logical pixels |
 | `app.setup.status` | ReadOnly | `EmptyParams` (`{}`) | `SetupResult`: permission placeholders, autostart state |
 | `app.setup.complete` | Mutating (registers autostart) | `EmptyParams` (`{}`) | `SetupResult` |
@@ -41,6 +42,9 @@ The shared command types live in `crates/orbit-core`. TypeScript bindings are ge
 | `ocr.current_screen` | ReadOnly | `EmptyParams` (`{}`) | `OcrResult`: text + lines/words with bbox |
 | `kb_record.start` | Mutating | `EmptyParams` (`{}`) | `null` |
 | `kb_record.stop` | Mutating | `EmptyParams` (`{}`) | `KbEvent[]` |
+| `kb_record.list` | ReadOnly | `EmptyParams` (`{}`) | `RecordingItem[]`: saved recordings, newest first |
+| `kb.replay` | Mutating (synthesizes input) | `KbReplayParams` (`{ recordingId, speed? }`) | `KbReplayResult`: `{ recordingId, eventCount, elapsedMs, driftMs }` |
+| `input.mouse` | Mutating (synthesizes local input) | `InputMouseParams` (`{ action, x?, y?, button?, count?, amount? }`) | `null` |
 | `convert.format` | Mutating (spawns ffmpeg) | `ConvertFormatParams` (`{ inputPath, outputPath, format }`) | `string`: output path |
 | `region.start` | Mutating (shows selection) | `EmptyParams` (`{}`) | `null` |
 | `region.finish` | Mutating (captures + writes clipboard) | `RegionFinishParams` (`{ monitorId, x, y, width, height }`) | `CommandResponse` (inner `screenshot.capture`) |
@@ -60,11 +64,13 @@ The 1x1 PNG smoke test (`image_preview_returns_base64_data_url`) pins this polic
 
 ### Window layout
 
-`overlay.layout` is the single source of truth for window and popup sizes. The host reads the three windows' initial sizes from `tauri.conf.json` (`main` 104×104, `clipboard` 420×560, `selection` 1×1) and keeps the side/notch/expanded sizes in `layout_config` (`src-tauri/src/lib.rs`); a missing config window is an error, not a duplicated fallback number. `App.svelte` injects the returned `WindowLayout` as CSS variables (`--orb-*-w/h`, `--orb-panel-inset`) at mount, so the orb's four states, the notch bar, the settings/monitor panels and the clipboard panel all follow the configured sizes. `:root` in `app.css` holds matching defaults for the first frame only. The disc SVG keeps a 340×340 `viewBox` as its geometry baseline and scales with the window, so changing a configured size does not require touching radius constants. The `selection` window is still resized to the whole monitor at runtime by `region.start`; that is capture behavior, not a layout contract.
+`overlay.layout` is the single source of truth for window and popup sizes. The host reads the three windows' initial sizes from `tauri.conf.json` (`main` 104×104, `clipboard` 420×560, `selection` 1×1) and keeps the side/notch/expanded sizes in `layout_config` (`src-tauri/src/lib.rs`); a missing config window is an error, not a duplicated fallback number. `clipboard` and `selection` carry `"create": false`: they are not instantiated at startup and are built on first use by `src-tauri/src/windows.rs` from the very same `WindowConfig` (via `WebviewWindowBuilder::from_config` on the main thread), which keeps this config block authoritative while cutting one or two WebView2 renderers from the idle process tree (see `docs/PERF.md`). `App.svelte` injects the returned `WindowLayout` as CSS variables (`--orb-*-w/h`, `--orb-panel-inset`) at mount, so the orb's four states, the notch bar, the settings/monitor panels and the clipboard panel all follow the configured sizes. `:root` in `app.css` holds matching defaults for the first frame only. The disc SVG keeps a 340×340 `viewBox` as its geometry baseline and scales with the window, so changing a configured size does not require touching radius constants. The `selection` window is still resized to the whole monitor at runtime by `region.start`; that is capture behavior, not a layout contract.
 
 ### Structured OCR output
 
-`ocr.image` and `ocr.current_screen` return `OcrResult { text, lines, textAngle }`. Each `OcrLine` carries `text`, `bbox` and its `words`; each `OcrWord` carries `text` and `bbox`. A bbox is `[x1, y1, x2, y2]` in pixels with the image top-left as origin — the same semantics as LiteParse's OCR HTTP contract — so a future PaddleOCR/Tesseract HTTP backend can be dropped in without changing the UI. Windows.Media.Ocr supplies `BoundingRect` for words; line bboxes are the union of their word boxes, and `textAngle` is nullable. Windows.Media.Ocr has no confidence score, so the contract deliberately omits it instead of fabricating `1.0`; an engine that does provide confidence can add the field later. The PowerShell script sets stdout to UTF-8 and emits compact JSON; `parse_ocr_output` in `src-tauri/src/lib.rs` rejects non-JSON and empty output explicitly. Still missing: macOS Vision and Linux backends, engine abstraction, and the cheap pre-check that avoids a PowerShell cold start when there is no text.
+`ocr.image` and `ocr.current_screen` return `OcrResult { text, lines, textAngle }`. Each `OcrLine` carries `text`, `bbox` and its `words`; each `OcrWord` carries `text` and `bbox`. A bbox is `[x1, y1, x2, y2]` in pixels with the image top-left as origin — the same semantics as LiteParse's OCR HTTP contract — so a future PaddleOCR/Tesseract HTTP backend can be dropped in without changing the UI. Windows.Media.Ocr supplies `BoundingRect` for words; line bboxes are the union of their word boxes, and `textAngle` is nullable. Windows.Media.Ocr has no confidence score, so the contract deliberately omits it instead of fabricating `1.0`; an engine that does provide confidence can add the field later.
+
+The default backend now calls Windows.Media.Ocr directly through the `windows` crate (`src-tauri/src/ocr_native.rs`, WinRT + MTA apartment), so a recognition no longer spawns PowerShell: the same synthetic image measures ~69 ms natively versus ~1792 ms through the PowerShell path, with identical word counts and bboxes (the smoke test asserts both). `ocr.rs` keeps the `OcrEngine` abstraction and falls back to the PowerShell implementation (`ocr_backend.rs`) if the native call fails, so the wire contract and availability do not change. The PowerShell fallback sets stdout to UTF-8 and emits compact JSON; `parse_ocr_output` rejects non-JSON and empty output explicitly. Still missing: macOS Vision and Linux backends, the optional PaddleOCR HTTP backend, and the cheap pre-check that avoids recognition work when there is no text.
 
 ### Recording region, state and recovery
 
@@ -74,6 +80,46 @@ gdigrab captures screen pixels and cannot exclude Orbit's own window, so `record
 
 Stop writes `q` to FFmpeg's stdin and waits up to 8 s. Only a forced kill (timed out) counts as a failure: the possibly truncated MP4 is moved to `app_data_dir()/record-recovery/`, and `recovery.json` is updated atomically via a `.tmp` rename with a `RecoveryItem { path, reason, createdAt, sizeBytes }`. `record.recovery.list` is a read-only, idempotent view of that manifest; the `recovering` event makes the frontend fetch it to report how many files are staged. A normal stop must not create recovery entries — both smoke tests assert `recovered == false` and read the MP4 metadata back with `ffprobe` (`codec_name=h264`, non-zero width, valid `format.duration`) to prove the MP4 tail is complete. This is a recovery area for incomplete files, not a WGC-style progressive-write crash recovery.
 
+### Structured errors
+
+`orbit_core::OrbitError { kind, message }` is the bus-level error type. `ErrorKind` is a stable cross-language enum (`param` / `not_found` / `permission` / `timeout` / `system` / `unsupported`) exported to TypeScript. Handlers may return `Result<_, OrbitError>` to attach an explicit class, or keep returning `Result<_, String>` — `From<String>` classifies it as `system`, so migrating handlers is incremental and never breaks the wire contract. `bus::execute` maps the error to `CommandResponse.errorKind` alongside `error`, and the frontend `runCommand()` throws a `CommandError` carrying `kind`, so callers can distinguish "fix the params" from "retry" and "ask for permission". Unknown command ids are `not_found`.
+
+### Testing tiers
+
+Unit tests (default `cargo test --workspace`) must pass anywhere and do not touch the OS desktop, clipboard, ffmpeg or PowerShell. Real-machine smoke tests (ffmpeg recording/merge/probe, PowerShell OCR, clipboard round-trip, synthetic input) are compiled only with `--features smoke` and run via `cargo test -p orbit-desktop --lib --features smoke`; CI keeps them in a separate job on `main` so PR feedback stays fast and hermetic. Missing ffmpeg/ffprobe makes the recording smoke tests skip themselves rather than fail.
+
+### Event bindings (L2)
+
+`bindings.json` lives in `app_data_dir()` and is the single source of truth for the binding layer. Structure: `{ version: 1, bindings: [{ event, modifier, action }], shortcuts: [{ accelerator, action }] }`. `BindingEvent` covers `left-click`, `left-double-click`, `middle-click`, `right-click`, `wheel-up`, `wheel-down`, `drop`, `hover-enter`, `hover-leave`; `Modifier` is `none` / `ctrl` / `alt` / `shift` / `ctrl+alt` / `ctrl+shift` / `alt+shift` / `ctrl+alt+shift`. `BindingAction` is internally tagged: `{ "type": "command", "id": "<command id>", "args"?: {...} }`, `{ "type": "menu", "menu": "clipboard" }`, or `{ "type": "macro", "id": "..." }`.
+
+Factory config keeps the pre-binding behavior: `Alt+V` → `menu:clipboard`. While a recording is active that action stops the recording instead of toggling the panel (the old hard-coded shortcut semantics are preserved inside `bindings::execute_action`).
+
+The file is validated on load: unknown menu names, implausible accelerators, duplicate event keys, duplicate accelerators, more than 64 event bindings or 32 shortcuts, and a wrong `version` are rejected. A missing, corrupt, or invalid file falls back to the factory config and is rewritten atomically (`.tmp` + rename); startup never fails because of bindings.
+
+Commands: `binding.list` (read), `binding.dispatch` (`{ event, modifier }` → executes the bound action, returns its result or `null` when unbound), `binding.upsert_event` / `binding.remove_event`, `binding.upsert_shortcut` / `binding.remove_shortcut` (all return the new `BindingsConfig`). Every mutation validates, persists, then re-registers global shortcuts immediately, so a shortcut change applies without a restart (P-07); a registration failure caused by another program holding the accelerator only logs a warning and keeps the persisted config. Successful mutations emit `binding://changed` with the new config.
+
+Frontend wiring: `App.svelte` forwards right-click and wheel events to `binding.dispatch` and only runs its built-in behavior (settings panel, scroll) when no binding matches, so the layer is opt-in. `binding.dispatch` returns `null` for unbound events, which is how the frontend distinguishes "not handled" from "handled with no payload".
+
+### Keyboard/mouse replay
+
+`kb_record.list` reads `recordings.db` (the same SQLite file `kb_record.stop` writes) and returns `RecordingItem { id, name, createdAt, durationMs, platform, eventCount }` newest-first, without loading the event bodies. `eventCount` is computed in SQL (`json_each`) so listing stays cheap.
+
+`kb.replay` takes `{ recordingId, speed? }`. `speed` defaults to 1.0 and must be within 0.1–10; outside that range the command fails before ANY input is synthesized. Events are scheduled against absolute timestamps (`sleep(target − scheduled)`, not accumulating sleeps), so error does not compound across the sequence. The command returns `KbReplayResult { recordingId, eventCount, elapsedMs, driftMs }`; `driftMs = elapsedMs − lastEventTimestamp/speed`, which is the observable P-09 signal (target < 20 ms per 10 s, still to be measured over a 30 s recording). Key names come from the recorder (`A`–`Z`, `0`–`9`, named keys, `F1`–`F12`); an unmapped `vkXX` name fails explicitly instead of silently dropping the event, and mouse `X1`/`X2` map to Back/Forward. Empty recordings, missing ids and unsupported event kinds are explicit errors. No loop replay yet. The UI entry is Settings → 键鼠回放 → 回放最近一次, which reports the returned event count, elapsed time and drift.
+
+`kb_record.start` / `kb_record.stop` are local, session-based capture (Windows low-level `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hooks; no network egress). During capture a low-frequency watcher thread reads the foreground window title and sets a sensitive flag; the hook callback only reads this atomic flag, and drops keyboard events (counting them as `redacted`) while a password/credential/banking window is focused — it never performs a blocking window query on the input thread. The count is surfaced via the `kb-record-state` event so the user is told how many keystrokes were skipped. `input.mouse` is the local mouse-control command: `plan_mouse` purely validates and classifies `{ move, click, scroll }` into a `MouseCommand` (unknown fields rejected, button ∈ Left/Right/Middle/X1/X2, count 1–10, scroll −10..10 nonzero), then the Windows build synthesizes it with `enigo`. Both parameter errors (`OrbitError::Param`) and synthesis failures are audited by the bus; nothing is forwarded across processes or over the network. The UI entry is Settings → 鼠标控制演示 → 移动并单击.
+
+## MCP exposure (read-only sidecar)
+
+MCP tools are **derived from the command catalog**, not hand-written: `orbit_core::read_only_tools()` filters `command_catalog()` to `RiskLevel::ReadOnly` and reuses each command's `params_schema` as `inputSchema`; the tool name is the command id. No new bus commands were added for MCP — the sidecar exposes an existing, audited surface. Mutating and destructive commands (`clipboard.clear`, `kb.replay`, `screenshot.capture`, …) are never listed and cannot be invoked.
+
+`orbit-mcp` is a separate binary in the same crate (`src-tauri/src/mcp/main.rs`), not linked against Tauri. It speaks MCP over stdio with newline-delimited JSON-RPC (`protocolVersion` `2024-11-05`, capabilities `tools`) and implements `initialize`, `ping`, `tools/list`, `tools/call`; notifications (no `id`) are ignored. stdout carries protocol messages only; diagnostics go to stderr.
+
+Calls are forwarded to the running app through a local bridge (`src-tauri/src/mcp_bridge.rs`): the host binds `127.0.0.1:0`, writes `{ port, token }` to `app_data_dir()/mcp-bridge.json`, and serves a line protocol — first line authenticates with the 64-hex one-time token, then each line is `{ commandId, params }` answered with a `CommandResponse`. The bridge re-checks `orbit_core::is_exposed` so a bypassed sidecar still cannot run write commands, and records refused calls in `audit_log` with `result = 'denied'`, `source = 'mcp'`.
+
+Audit source is now explicit: bus `execute` takes `source` (`orb` for UI commands and region capture, `hotkey` for global shortcuts / event bindings, `mcp` for sidecar calls).
+
+Limitations: no HTTP transport (stdio only, per README §1.2); no per-client tool allowlists yet; the bridge trusts the OS user account, so the token file is the security boundary between same-user processes, not a multi-tenant auth scheme.
+
 ## Invocation and audit
 
 The command bus lives in `src-tauri/src/bus.rs`. It is a registry: each command id maps to a `CommandSpec` (from the `orbit-core::command_catalog` single source) plus a strongly-typed handler. `bus::execute` is the only entry point: registry lookup → typed param deserialization (`deny_unknown_fields`) → execution on the blocking pool → audit → `CommandResponse`. Unknown ids return an error response and are audited.
@@ -82,13 +128,13 @@ The Tauri UI invokes `execute_command` with a `CommandRequest`. The source is as
 
 Audit writes are asynchronous: they run in a background task and do not block the command response. If the audit write itself fails, the failure is logged and the command result is unaffected.
 
-The command catalog is available through `get_command_catalog`, which reads directly from the bus registry so the advertised catalog always matches routable commands. All shared request/response/event types are defined in `crates/orbit-core/src/contract.rs`, re-exported from `lib.rs`, and listed in the tables above; `cargo test -p orbit-core` regenerates 41 `.ts` bindings into `crates/orbit-core/bindings/` with `ts-rs`, while `schemars` produces JSON Schema from the same Rust types. The frontend imports these generated bindings directly and must not hand-write duplicate contract types.
+The command catalog is available through `get_command_catalog`, which reads directly from the bus registry so the advertised catalog always matches routable commands. All shared request/response/event types are defined in `crates/orbit-core/src/contract.rs`, re-exported from `lib.rs`, and listed in the tables above; `cargo test -p orbit-core` regenerates all `.ts` bindings into `crates/orbit-core/bindings/` with `ts-rs` (65 files as of 2026-11-19), while `schemars` produces JSON Schema from the same Rust types. The frontend imports these generated bindings directly and must not hand-write duplicate contract types.
 
 Non-empty parameter commands are strict: `SetOverlayOpenParams`, `SetAutostartParams`, all clipboard parameter types, `OcrImageParams`, `RecordStartParams` (and its nested `CaptureRegion`), `ConvertFormatParams`, `RegionFinishParams`, and `SetElevatedParams` use `deny_unknown_fields`, so `{ "open": true, "expanded": true }` is rejected instead of silently ignored. Callers must always send a params object (`{}` for no-arg commands) rather than `null`, because `EmptyParams` rejects `null`; the frontend `runCommand()` helper defaults to `{}`.
 
 ## Events
 
-Events are not commands and are not audited. `orbit-core::event_catalog()` is the single source of truth for the **four host-emitted** event ids and their payload schemas; `bus::emit` rejects ids that are not registered, so a typo cannot silently produce an event no frontend listens to. `ClipboardChanged`, `RegionSelectionStart` and `RecordStateEvent` live in `orbit-core` and are exported to TypeScript together with command types. The `system-metrics` id was removed on 2026-11-11: a once-per-second sampler was emitting it while the frontend only stored the payload, so both the thread and the contract were deleted.
+Events are not commands and are not audited. `orbit-core::event_catalog()` is the single source of truth for the **seven host-emitted** event ids and their payload schemas; `bus::emit` rejects ids that are not registered, so a typo cannot silently produce an event no frontend listens to. `ClipboardChanged`, `RegionSelectionStart`, `RecordStateEvent` and `KbRecordStateEvent` live in `orbit-core` and are exported to TypeScript together with command types. The `system-metrics` id was removed on 2026-11-11: a once-per-second sampler was emitting it while the frontend only stored the payload, so both the thread and the contract were deleted.
 
 | Event id | Payload | Emitted by |
 | --- | --- | --- |
@@ -96,6 +142,9 @@ Events are not commands and are not audited. `orbit-core::event_catalog()` is th
 | `clip://shown` | `null` | clipboard window focus helper |
 | `region-selection-start` | `RegionSelectionStart` (`{ monitorId }`) | region selection command |
 | `record-state` | `RecordStateEvent` (`{ phase, path, message, paused }`) | `record.start` / `record.pause` / `record.resume` / `record.stop` / recording shortcut |
+| `kb-record-state` | `KbRecordStateEvent` (`{ active, redactedCount }`) | `kb_record.start` / `kb_record.stop` |
+| `binding://changed` | `BindingsConfig` | `binding.upsert_*` / `binding.remove_*` |
+| `remote://state` | `RemoteStatus` | `remote.serve.start` / `remote.serve.stop` |
 
 Audit boundary: every command invocation, including `region.*`, is written to `audit_log` with status and duration. Events are notifications, not commands, and are deliberately **not** audited; an emission failure is logged (`log::warn`) and never fails the originating command. For example, a clipboard history write succeeds even if `clip://changed` cannot be delivered. Since 2026-11-11 the log plugin is registered in release builds too (Warn level), so these warnings are no longer silently dropped in the shipped exe.
 
@@ -116,9 +165,13 @@ Region selection semantics:
 
 ## Command bus coverage (no direct IPC commands)
 
-As of 2026-11-11 the command bus covers all 41 commands: `screenshot.capture`, `system.info`, `system.dash`, `system.monitor`, `overlay.dock`, `overlay.set_open`, `overlay.layout`, `app.setup.status`, `app.setup.complete`, `app.autostart.set`, `app.quit`, the 15 `clipboard.*` commands, the pure request-response batch `record.start`, `record.pause`, `record.resume`, `record.stop`, `record.recovery.list`, `ocr.image`, `ocr.current_screen`, `kb_record.start`, `kb_record.stop`, `convert.format`, the event-push batch `region.start`, `region.finish`, `region.cancel`, and the elevated pair `elevated.set`, `elevated.status`. The implementations live in `src-tauri/src/lib.rs` (plus `clipboard.rs`, `elevated.rs`) as plain `pub(crate)` functions.
+As of 2026-11-19 the command bus covers all 56 commands: `screenshot.capture`, `system.info`, `system.dash`, `system.monitor`, `overlay.dock`, `overlay.set_open`, `overlay.set_ball_radius`, `overlay.layout`, `app.setup.status`, `app.setup.complete`, `app.autostart.set`, `app.quit`, the 15 `clipboard.*` commands, the pure request-response batch `record.start`, `record.pause`, `record.resume`, `record.stop`, `record.recovery.list`, `ocr.image`, `ocr.current_screen`, `kb_record.start`, `kb_record.stop`, `kb_record.list`, `kb.replay`, `input.mouse`, `convert.format`, the event-push batch `region.start`, `region.finish`, `region.cancel`, the elevated pair `elevated.set`, `elevated.status`, and the six binding commands `binding.list`, `binding.dispatch`, `binding.upsert_event`, `binding.remove_event`, `binding.upsert_shortcut`, `binding.remove_shortcut`. Implementations live in `src-tauri/src/lib.rs` (window layout, overlay state, setup, region selection, `run()`), `recording.rs`, `ocr.rs` + `ocr_backend.rs`, `convert.rs`, `monitor.rs`, `bindings.rs`, `windows.rs`, `clipboard.rs`, `elevated.rs`, `input_recorder.rs` and `screenshot.rs` as plain `pub(crate)` functions re-exported from the crate root.
 
 `invoke_handler` registers exactly two IPC commands: `get_command_catalog` (read-only schema discovery) and `execute_command` (the sole execution path). The per-command `#[tauri::command]` delegates were deleted on 2026-11-10 after the frontend switched every call to `runCommand()` in `src/bus.ts`, so there is no second entry point that could bypass registry lookup, param validation, or auditing.
+
+### Ball radius and overlay geometry
+
+`overlay.set_ball_radius` stores the center-ball radius in `OverlayState` and immediately re-applies the overlay layout. In the collapsed floating state the window edge equals `max(radius × 2, 104)` (capped by the 340 expanded size), so the ball is never clipped; docked (side/notch) and expanded states keep their fixed sizes. The frontend persists the radius in `localStorage` (`orbit.ballRadius`) and syncs it on startup and after every layout save, so the saved value is global (collapsed and expanded alike). The three concentric radii keep the invariant `ball + 3 ≤ inner`, `inner + 18 ≤ outer ≤ 166`, with `ball ≤ 136` and `inner ≤ 148`. Dragging in the layout editor uses "push outward" coupling: enlarging the ball pushes the inner ring out, which pushes the outer ring out; nothing is silently clamped to a small constant.
 
 ### Elevated helper boundaries
 

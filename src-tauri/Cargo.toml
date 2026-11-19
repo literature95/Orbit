@@ -18,8 +18,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "orbit-elevated-helper"
 path = "src/helper/main.rs"
 
+[[bin]]
+name = "orbit-mcp"
+path = "src/mcp/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }
+
+# 实机冒烟测试：依赖真实 ffmpeg / PowerShell / 剪贴板 / 键鼠钩子，
+# 仅在本地或专用 CI 作业以 `--features smoke` 显式开启，默认 CI 只跑纯单测。
+[features]
+smoke = []
 
 [dependencies]
 serde_json = "1.0"
@@ -33,6 +42,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 orbit-core = { version = "0.1.0", path = "../crates/orbit-core" }
+orbit-ocr = { version = "0.1.0", path = "../crates/orbit-ocr" }
 xcap = "0.9.8"
 arboard = "3.7.0"
 # 剪贴板：OS 级事件监听（Windows WM_CLIPBOARDUPDATE）+ 多格式读取
@@ -41,12 +51,12 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 sha2 = "0.10"
 regex = "1"
 base64 = "0.21"
+# 远程只读服务的一次性配对令牌；只用 OS 熵，不引入完整 rand。
+getrandom = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
-
-# enigo 只用于 input_recorder 的合成按键测试，不进入生产二进制。
-[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_WinRT", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader", "Foundation", "Foundation_Collections", "Graphics_Capture", "Graphics_DirectX", "Graphics_DirectX_Direct3D11", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams"] }
+# enigo：键鼠回放（命令 kb.replay）与录制冒烟测试共用；仅 Windows 编译。
 enigo = "0.2"
 
 # helper 二进制与主进程共享 serde / serde_json；sysinfo 仅保留 system feature。

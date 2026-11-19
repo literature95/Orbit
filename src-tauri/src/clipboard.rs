@@ -701,14 +701,9 @@ pub fn close_window(app: &AppHandle) -> Result<(), String> {
     hide_clipboard_window(app)
 }
 
-pub fn shortcut() -> String {
-    CLIP_SHORTCUT.to_string()
-}
-
 fn show_clipboard_window(app: &AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("clipboard")
-        .ok_or_else(|| "找不到剪贴板窗口".to_string())?;
+    // 惰性创建：首次打开时才建 webview，启动期不常驻渲染进程（见 docs/PERF.md）。
+    let window = crate::windows::ensure(app, crate::windows::CLIPBOARD_LABEL)?;
     app.state::<ClipboardState>().mark_shown();
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
@@ -719,19 +714,20 @@ fn show_clipboard_window(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_clipboard_window(app: &AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("clipboard")
-        .ok_or_else(|| "找不到剪贴板窗口".to_string())?;
-    window.hide().map_err(|error| error.to_string())
+    // 窗口可能从未创建（惰性窗口）：隐藏已经不存在的东西是空操作。
+    match app.get_webview_window(crate::windows::CLIPBOARD_LABEL) {
+        Some(window) => window.hide().map_err(|error| error.to_string()),
+        None => Ok(()),
+    }
 }
 
 /// 供全局快捷键调用：可见则隐藏，不可见则显示并聚焦。
 pub fn toggle_clipboard_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("clipboard") else {
-        log::warn!("找不到剪贴板窗口");
-        return;
-    };
-    let result = if window.is_visible().unwrap_or(false) {
+    let visible = app
+        .get_webview_window(crate::windows::CLIPBOARD_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    let result = if visible {
         hide_clipboard_window(app)
     } else {
         show_clipboard_window(app)
@@ -813,6 +809,8 @@ mod tests {
     }
 
     /// 冒烟 1：真实写系统剪贴板并读回，结束后恢复原内容。
+    /// 依赖可交互桌面会话，仅 `--features smoke` 时编译。
+    #[cfg(feature = "smoke")]
     #[test]
     fn write_then_read_roundtrip_restores_clipboard() {
         let original = read_text().ok();

@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: orbit-core tests + TS bindings drift
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+      # cargo test -p orbit-core 同时执行 ts-rs 导出，重新生成 bindings/*.ts。
+      - name: Run orbit-core tests (regenerates TS bindings)
+        run: cargo test -p orbit-core
+      # 生成产物若有未提交差异或新增文件即失败，防止契约与前端 TS 类型漂移。
+      - name: Check TS bindings are up to date
+        shell: pwsh
+        run: |
+          $diff = git status --porcelain -- crates/orbit-core/bindings
+          if ($diff) {
+            Write-Host $diff
+            throw "TS bindings drifted from committed artifacts. Run 'cargo test -p orbit-core' locally and commit bindings/."
+          }
+
+  # 出网出口守卫：作者监听线必须为空（docs/SAFETY.md §4）。
+  # 新增任何 TcpListener/TcpStream/DNS 调用必须先在脚本白名单登记并过 PR 评审。
+  egress-guard:
+    name: egress guard (author line must stay empty)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run egress guard
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/egress-audit/check-egress.ps1 -RepoRoot $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  desktop-unit:
+    name: desktop unit tests + frontend check/build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+      - run: npm ci
+      # 默认（无 --features smoke）只跑纯单测；范围含 tests/ 集成测试（MCP sidecar stdio）。
+      - name: Run desktop unit and integration tests
+        run: cargo test -p orbit-desktop
+      - name: Frontend type check
+        run: npm run check
+      - name: Frontend build
+        run: npm run build
+
+  # 可选实机冒烟：Windows runner 自带交互桌面与 PowerShell，ffmpeg 需手动安装。
+  # 测试内部对缺失的 ffmpeg/ffprobe 自行跳过；剪贴板/键鼠冒烟必须真实执行。
+  # 默认仅在 push 到 main 时运行，PR 需要时可手动触发整个 workflow_dispatch 包装。
+  smoke-tests:
+    name: real-machine smoke tests (feature = smoke)
+    runs-on: windows-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+      - name: Install ffmpeg/ffprobe
+        run: choco install ffmpeg -y --no-progress
+      - name: Run smoke tests
+        run: cargo test -p orbit-desktop --lib --features smoke
