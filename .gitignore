@@ -3,3 +3,6 @@ dist/
 .vite/
 /target/
 .workbuddy/
+# 本地打包产物（CI 打包通过后下载到本机验证，不入库）
+/packaged/
+/Orbit-installer-artifact.zip
