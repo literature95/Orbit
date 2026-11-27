@@ -700,32 +700,22 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
   color: #c9d4f5;
 }
 
-/* 文件拖放：折叠态球与展开态圆盘都给出可放置反馈 */
-.app-shell.drop-active .orb-button,
-.app-shell.drop-active .disc,
-.app-shell.drop-active .notch-button,
-.app-shell.drop-active .edge-button {
-  filter: drop-shadow(0 0 14px rgba(130, 195, 255, .95));
+/* 拖放文件悬停扇区：高亮即目标，松手直接转换或取消 */
+.seg-group.drop-hover .seg-fill {
+  fill: rgba(130, 195, 255, .55);
+  stroke: rgba(180, 220, 255, .95);
+  stroke-width: 1.5;
 }
-.drop-hint {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 12;
-  pointer-events: none;
-  padding: 4px 9px;
-  border-radius: 999px;
-  background: rgba(3, 3, 10, .88);
-  border: 1px solid rgba(180, 210, 255, .55);
-  color: #dfe7ff;
-  font-size: 11px;
-  white-space: nowrap;
+.seg-group.drop-hover .seg-label {
+  fill: #fff;
+  font-weight: 700;
 }
-:root[data-theme="orbit-white"] .drop-hint {
-  background: rgba(255, 255, 255, .92);
-  border-color: rgba(0, 0, 0, .2);
-  color: #222;
+:root[data-theme="orbit-white"] .seg-group.drop-hover .seg-fill {
+  fill: rgba(30, 120, 255, .45);
+  stroke: #1e78ff;
+}
+:root[data-theme="orbit-white"] .seg-group.drop-hover .seg-label {
+  fill: #000;
 }
 
 /* 设置页：在展开窗口内替换圆盘 */

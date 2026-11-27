@@ -62,8 +62,8 @@
   let flashIndex = -1;
   let convertInput: string | null = null;
   let convertBusy = false;
-  // 文件拖到悬浮球/圆盘时高亮提示，松手后进入与「选文件」相同的转换流程。
-  let dropActive = false;
+  // 拖拽文件时悬停的扇区索引；-1 表示不在任何扇区上。
+  let dropHoverIndex = -1;
   // 目标格式由后端引擎声明（convert.formats），前端不再硬编码白名单。
   let convertFormats: string[] = [];
   let convertJob: ConvertJobStatus | null = null;
@@ -503,19 +503,19 @@
     }
   }
 
-  /** 选文件与拖放共用：拿到输入路径后展开圆盘并拉取目标格式。 */
-  async function prepareConvert(input: string, prefix = ''): Promise<void> {
+  /** 拿到输入路径后展开圆盘，扇区切换为格式列表；先用内置列表保证拖拽时立刻可命中。 */
+  async function beginConvertMode(input: string): Promise<void> {
+    if (convertBusy) return;
     convertJob = null;
     convertInput = input;
+    dropHoverIndex = -1;
+    convertFormats = Object.keys(CONVERT_LABELS);
+    notice = '';
     if (!panelOpen) await setPanelOpen(true);
-    notice = `${prefix}🔄 正在读取可用格式…`;
     try {
       convertFormats = await runCommand<string[]>('convert.formats');
-      notice = `${prefix}🔄 选择目标格式`;
-    } catch (formatError) {
-      // 后端不可用时退回已知格式，保证基础转换仍可用
-      convertFormats = Object.keys(CONVERT_LABELS);
-      notice = `${prefix}读取格式失败，使用内置列表：${String(formatError)}`;
+    } catch {
+      // 后端不可用时保留内置列表，基础转换仍可用。
     }
   }
 
@@ -526,17 +526,19 @@
       const { open } = await import('@tauri-apps/plugin-dialog');
       const input = await open({ title: '选择要转换的文件', multiple: false });
       if (!input || typeof input !== 'string') { notice = '已取消'; return; }
-      await prepareConvert(input);
+      await beginConvertMode(input);
     } catch (e) { notice = `选择文件失败：${String(e)}`; }
   }
 
-  /** Tauri 原生文件拖放：一次只处理一个文件，多个时明确告知取第一个。 */
-  function handleFileDrop(paths: string[]): void {
-    if (convertBusy) { notice = '当前有转换任务，请等待完成或先取消。'; return; }
-    if (paths.length === 0) return;
-    const input = paths[0];
-    const prefix = paths.length > 1 ? '一次仅转换一个文件，已取第一个。' : '';
-    void prepareConvert(input, prefix);
+  /** 拖放位置是物理像素，换算后判断落在哪个扇区。 */
+  function dropSectorAt(position: { x: number; y: number }): number {
+    const scale = window.devicePixelRatio || 1;
+    const x = position.x / scale - DCX;
+    const y = position.y / scale - DCY;
+    const radius = Math.hypot(x, y);
+    if (radius < viewRIn || radius > viewROut + 28) return -1;
+    const angle = (Math.atan2(y, x) + 2 * Math.PI) % (2 * Math.PI);
+    return Math.floor((angle / (2 * Math.PI)) * sectorCount) % sectorCount;
   }
 
   async function chooseConvertFormat(format: string) {
@@ -570,20 +572,13 @@
     }
   }
 
-  async function cancelConvert() {
+  /** 静默取消：直接回主轮盘，不弹提示；后台任务由终态事件自行收尾。 */
+  async function cancelConvert(): Promise<void> {
     const jobId = convertJob?.jobId;
-    // 无论是否已启动任务都回到主轮盘；后台任务由终态事件收尾。
     convertInput = null;
-    if (jobId) {
-      try {
-        await runCommand('convert.cancel', { jobId });
-        notice = '🛑 已请求取消转换';
-      } catch (e) {
-        notice = `取消失败：${String(e)}`;
-      }
-    } else {
-      notice = '已取消转换';
-    }
+    dropHoverIndex = -1;
+    notice = '';
+    if (jobId) await runCommand('convert.cancel', { jobId }).catch(() => {});
   }
 
   /** convert-state 事件：只接受当前任务，终态时收起面板并提示结果。 */
@@ -598,7 +593,8 @@
     }
     convertBusy = false;
     convertInput = null;
-    if (status.state === 'cancelled') notice = '已取消转换';
+    dropHoverIndex = -1;
+    if (status.state === 'cancelled') notice = '';
     else if (status.error) notice = `转换失败：${status.error}`;
     else notice = `✅ 转换完成：${status.outputPath ?? ''}`;
   }
@@ -735,11 +731,25 @@
         handleConvertState(payload);
       }),
       getCurrentWindow().onDragDropEvent(({ payload }) => {
-        if (payload.type === 'enter' || payload.type === 'over') dropActive = true;
-        else if (payload.type === 'leave') dropActive = false;
-        else if (payload.type === 'drop') {
-          dropActive = false;
-          handleFileDrop(payload.paths);
+        if (payload.type === 'enter') {
+          dropHoverIndex = -1;
+          if (payload.paths.length) void beginConvertMode(payload.paths[0]);
+        } else if (payload.type === 'over') {
+          // 拖到哪个扇区就高亮哪个，松手即转换到该格式。
+          dropHoverIndex = dropSectorAt(payload.position);
+        } else if (payload.type === 'leave') {
+          dropHoverIndex = -1;
+          if (convertInput && !convertBusy) void cancelConvert();
+        } else if (payload.type === 'drop') {
+          const index = dropSectorAt(payload.position);
+          dropHoverIndex = -1;
+          const action = index >= 0 ? convertActions[index] : undefined;
+          if (!action) {
+            if (convertInput && !convertBusy) void cancelConvert();
+            return;
+          }
+          if (action.id === 'convert:cancel') void cancelConvert();
+          else if (action.format) void chooseConvertFormat(action.format);
         }
       }),
       listen<RemoteStatus>('remote://state', ({ payload }) => {
@@ -1489,13 +1499,9 @@
   class:top-docked={dockPosition === 'top'}
   class:left-docked={dockPosition === 'left'}
   class:right-docked={dockPosition === 'right'}
-  class:drop-active={dropActive}
   class="app-shell"
   style:--orb-size={`${viewBallRadius * 2}px`}
 >
-  {#if dropActive}
-    <div class="drop-hint" aria-hidden="true">松手转换</div>
-  {/if}
   {#if remoteStatus.running}
     <div class="remote-badge" title={`远程只读服务运行中：${remoteStatus.endpoint ?? ''}`} aria-label="远程只读服务运行中">R</div>
   {/if}
@@ -1559,6 +1565,7 @@
           class="seg-group"
           class:flash={flashIndex === i}
           class:edit-highlight={editMode && editTarget === i}
+          class:drop-hover={dropHoverIndex === i}
           role="button"
           tabindex="0"
           aria-label={a.label}
