@@ -128,6 +128,8 @@
     icon: string;
     label: string;
     title?: string;
+    /** 格式选择态的扇区携带目标格式，用于点击后启动转换。 */
+    format?: string;
     handler: () => void | Promise<void>;
   }
   const actions: DiscAction[] = [
@@ -235,7 +237,25 @@
   $: draftActions = draftLayout
     .map((id) => ACTION_MAP.get(id))
     .filter((action): action is DiscAction => Boolean(action));
-  $: viewActions = editMode ? draftActions : discActions;
+  // 格式选择态：圆盘扇区直接变成目标格式，末尾追加「取消」扇区返回主轮盘。
+  $: convertActions = [
+    ...convertFormats.map((format): DiscAction => ({
+      id: `convert:${format}`,
+      icon: '🔄',
+      label: format.toUpperCase(),
+      title: `转换为 ${convertLabel(format)}`,
+      format,
+      handler: () => chooseConvertFormat(format),
+    })),
+    {
+      id: 'convert:cancel',
+      icon: '✕',
+      label: '取消',
+      title: '取消转换，返回主轮盘',
+      handler: () => cancelConvert(),
+    },
+  ];
+  $: viewActions = editMode ? draftActions : (convertInput ? convertActions : discActions);
   $: sectorCount = viewActions.length || 1;
   $: unusedActions = actions.filter((action) => !draftLayout.includes(action.id));
 
@@ -528,7 +548,7 @@
         title: `保存为 .${format}`,
         defaultPath: input.replace(/\.[^.]+$/, `.${format}`),
       });
-      if (!outPath) return;
+      if (!outPath) { notice = '已取消保存，仍在格式选择'; return; }
       convertBusy = true;
       notice = `🔄 正在转换为 ${format.toUpperCase()}…`;
       // 异步启动：后续进度与结果由 convert-state 事件回流，不阻塞 UI。
@@ -552,6 +572,8 @@
 
   async function cancelConvert() {
     const jobId = convertJob?.jobId;
+    // 无论是否已启动任务都回到主轮盘；后台任务由终态事件收尾。
+    convertInput = null;
     if (jobId) {
       try {
         await runCommand('convert.cancel', { jobId });
@@ -560,7 +582,6 @@
         notice = `取消失败：${String(e)}`;
       }
     } else {
-      convertInput = null;
       notice = '已取消转换';
     }
   }
@@ -1281,6 +1302,10 @@
         cancelEdit();
         return;
       }
+      if (convertInput) {
+        void cancelConvert();
+        return;
+      }
       void setPanelOpen(false);
     }
   }
@@ -1670,38 +1695,6 @@
           <button type="button" class="convert-option cancel" onclick={() => { trayOpen = false; }}>取消</button>
         </div>
       {/if}
-    {:else if convertInput}
-      <div class="convert-picker" role="dialog" aria-label="格式转换">
-        {#if convertJob && (convertJob.state === 'queued' || convertJob.state === 'running')}
-          <p class="convert-title">正在转换为 {convertJob.to.toUpperCase()}…</p>
-          <div
-            class="convert-progress"
-            role="progressbar"
-            aria-valuenow={Math.round(convertJob.progress * 100)}
-            aria-valuemin="0"
-            aria-valuemax="100"
-          >
-            <div class="convert-progress-fill" style="width: {Math.round(convertJob.progress * 100)}%"></div>
-          </div>
-          <p class="convert-progress-text">{Math.round(convertJob.progress * 100)}%</p>
-          <button type="button" class="convert-option cancel" onclick={() => void cancelConvert()}>取消</button>
-        {:else}
-          <p class="convert-title">转换为…</p>
-          {#each convertFormats as format}
-            <button
-              type="button"
-              class="convert-option"
-              disabled={convertBusy}
-              onclick={() => void chooseConvertFormat(format)}
-            >{convertLabel(format)}</button>
-          {/each}
-          <button
-            type="button"
-            class="convert-option cancel"
-            onclick={() => void cancelConvert()}
-          >取消</button>
-        {/if}
-      </div>
     {/if}
     {#if monitorOpen}
       <SystemMonitor onclose={() => { monitorOpen = false; }} />
