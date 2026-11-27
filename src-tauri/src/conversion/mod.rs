@@ -9,9 +9,11 @@
 //! 命令总线门面在 `convert.rs`，本模块不依赖 Tauri，便于纯单测。
 
 pub(crate) mod engine;
+pub(crate) mod formats;
 mod job;
 mod model;
 mod output;
+mod process;
 mod planner;
 mod registry;
 

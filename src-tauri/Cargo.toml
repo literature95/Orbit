@@ -44,6 +44,8 @@ sysinfo = { version = "0.37.2", default-features = false, features = ["system"] 
 orbit-core = { version = "0.1.0", path = "../crates/orbit-core" }
 orbit-ocr = { version = "0.1.0", path = "../crates/orbit-ocr" }
 xcap = "0.9.8"
+# 图片引擎：纯 Rust 解码/编码，支持 png/jpg/webp/bmp/tiff/ico 等互转
+image = "0.25"
 arboard = "3.7.0"
 # 剪贴板：OS 级事件监听（Windows WM_CLIPBOARDUPDATE）+ 多格式读取
 clipboard-rs = "0.3"

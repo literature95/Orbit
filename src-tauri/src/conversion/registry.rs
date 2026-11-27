@@ -5,6 +5,7 @@
 use std::sync::{Arc, OnceLock};
 
 use super::engine::ffmpeg::FfmpegConverter;
+use super::engine::image::ImageConverter;
 use super::model::Converter;
 
 pub(crate) struct ConverterRegistry {
@@ -14,7 +15,12 @@ pub(crate) struct ConverterRegistry {
 impl ConverterRegistry {
     pub(crate) fn global() -> &'static Self {
         static REGISTRY: OnceLock<ConverterRegistry> = OnceLock::new();
-        REGISTRY.get_or_init(|| Self::new(vec![Arc::new(FfmpegConverter::new())]))
+        REGISTRY.get_or_init(|| {
+            Self::new(vec![
+                Arc::new(FfmpegConverter::new()),
+                Arc::new(ImageConverter),
+            ])
+        })
     }
 
     fn new(converters: Vec<Arc<dyn Converter>>) -> Self {
@@ -35,10 +41,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_exposes_ffmpeg_with_stable_id() {
+    fn registry_exposes_both_engines() {
         let registry = ConverterRegistry::global();
-        assert_eq!(registry.all().len(), 1);
+        assert_eq!(registry.all().len(), 2);
         assert!(registry.by_id("ffmpeg").is_some());
+        assert!(registry.by_id("image").is_some());
         assert!(registry.by_id("missing").is_none());
     }
 }

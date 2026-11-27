@@ -180,6 +180,22 @@ mod tests {
     }
 
     #[test]
+    fn two_engines_form_a_real_multihop_route() {
+        // FFmpeg: mp4 → png（抽帧）；image: png → tiff。没有直接边，必须走两跳。
+        let ffmpeg_edges: &'static [ConversionEdge] = &[ConversionEdge::new("mp4", "png")];
+        let image_edges: &'static [ConversionEdge] = &[ConversionEdge::new("png", "tiff")];
+        let converters: Vec<Arc<dyn Converter>> = vec![
+            Arc::new(FakeConverter { id: "ffmpeg", edges: ffmpeg_edges }),
+            Arc::new(FakeConverter { id: "image", edges: image_edges }),
+        ];
+        let route = planner(&converters).plan("mp4", "tiff").unwrap();
+        assert_eq!(route.steps.len(), 2);
+        assert_eq!(route.steps[0].converter_id, "ffmpeg");
+        assert_eq!(route.steps[1].converter_id, "image");
+        assert_eq!(route.cost, 20);
+    }
+
+    #[test]
     fn direct_only_edge_is_never_an_intermediate_hop() {
         static EDGES: &[ConversionEdge] = &[
             ConversionEdge::new("a", "b"),

@@ -1,23 +1,49 @@
-//! FFmpeg 引擎：把原 `convert.rs` 的格式白名单与参数表收进 Converter 契约。
+//! FFmpeg 引擎：音视频转码、视频抽帧、图片转动图/视频。
 //!
-//! 每个目标格式是一条从通配源（`*`）出发的边。新增目标格式只需在这里加一条边
-//! 和一个参数分支，规划器、`convert.formats`、`convert.plan` 自动随之更新。
+//! 边由 LazyLock 生成，覆盖常见音视频源；与 image 引擎组合形成多跳路由，
+//! 例如 `mp4 → png`（本引擎抽帧）→ `tiff`（image 引擎）。
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
 
-use crate::NoWindow;
+use crate::conversion::CancelToken;
 use crate::conversion::model::{
-    ANY_FORMAT, ConversionEdge, ConversionStep, Converter, ConverterStatus,
+    ConversionEdge, ConversionStep, Converter, ConverterStatus,
 };
+use crate::conversion::process;
 
-/// 目标格式 → ffmpeg 参数。与旧实现保持一致，避免行为漂移。
-const EDGES: &[ConversionEdge] = &[
-    ConversionEdge::new(ANY_FORMAT, "mp3"),
-    ConversionEdge::new(ANY_FORMAT, "wav"),
-    ConversionEdge::new(ANY_FORMAT, "mp4"),
-    ConversionEdge::new(ANY_FORMAT, "gif"),
-    ConversionEdge::new(ANY_FORMAT, "webp"),
-];
+const VIDEO_SOURCES: &[&str] = &["mp4", "mov", "mkv", "avi", "webm", "m4v"];
+const AUDIO_SOURCES: &[&str] = &["mp3", "wav", "flac", "aac", "ogg", "m4a"];
+const IMAGE_SOURCES: &[&str] = &["png", "jpg", "webp", "gif", "bmp"];
+const VIDEO_TARGETS: &[&str] = &["mp4", "gif", "webp"];
+const IMAGE_TARGETS: &[&str] = &["png", "jpg", "webp", "gif"];
+const AUDIO_TARGETS: &[&str] = &["mp3", "wav", "flac"];
+
+static EDGES: LazyLock<Vec<ConversionEdge>> = LazyLock::new(|| {
+    let mut edges = Vec::new();
+    // 视频 → 图片（抽帧）/ 视频 / 音频
+    for from in VIDEO_SOURCES {
+        for to in IMAGE_TARGETS.iter().chain(VIDEO_TARGETS).chain(AUDIO_TARGETS) {
+            edges.push(ConversionEdge::new(from, to));
+        }
+    }
+    // 音频 → 音频
+    for from in AUDIO_SOURCES {
+        for to in AUDIO_TARGETS {
+            if from != to {
+                edges.push(ConversionEdge::new(from, to));
+            }
+        }
+    }
+    // 图片 → 动图 / 视频
+    for from in IMAGE_SOURCES {
+        for to in ["mp4", "gif", "webp"] {
+            edges.push(ConversionEdge::new(from, to));
+        }
+    }
+    edges
+});
 
 pub(crate) struct FfmpegConverter;
 
@@ -37,7 +63,7 @@ impl Converter for FfmpegConverter {
     }
 
     fn edges(&self) -> &'static [ConversionEdge] {
-        EDGES
+        &EDGES
     }
 
     fn status(&self) -> ConverterStatus {
@@ -74,73 +100,42 @@ pub(crate) fn convert_with_ffmpeg(
     input_path: &str,
     output_path: &str,
     format: &str,
-    cancel: &crate::conversion::CancelToken,
+    cancel: &CancelToken,
 ) -> Result<String, String> {
     let mut output = output_path.to_string();
     if !output.to_lowercase().ends_with(&format!(".{format}")) {
         output = format!("{}.{}", output.trim_end_matches('.'), format);
     }
-    let out_path = Path::new(&output);
-    if let Some(parent) = out_path.parent() {
+    if let Some(parent) = Path::new(&output).parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
     let args: Vec<&str> = match format {
         "mp3" => vec!["-y", "-i", input_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", &output],
         "wav" => vec!["-y", "-i", input_path, "-vn", "-acodec", "pcm_s16le", &output],
+        "flac" => vec!["-y", "-i", input_path, "-vn", "-acodec", "flac", &output],
         "mp4" => vec!["-y", "-i", input_path, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", &output],
         "gif" => vec!["-y", "-i", input_path, "-vf", "fps=12,scale=480:-1", &output],
         "webp" => vec!["-y", "-i", input_path, "-vf", "fps=15", "-loop", "0", &output],
+        "png" => vec!["-y", "-i", input_path, "-frames:v", "1", &output],
+        "jpg" => vec!["-y", "-i", input_path, "-frames:v", "1", "-q:v", "2", &output],
         other => return Err(format!("不支持的目标格式：{other}")),
     };
 
-    let mut child = std::process::Command::new(ffmpeg)
-        .no_window()
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "找不到 ffmpeg。请安装 ffmpeg 并加入 PATH，或设置 FFMPEG_PATH 环境变量。".to_string()
-            } else {
-                format!("FFmpeg 启动失败：{error}")
-            }
-        })?;
-
-    // stderr 必须在独立线程排空，否则 ffmpeg 日志写满管道后会阻塞。
-    let stderr_thread = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buffer = String::new();
-            use std::io::Read;
-            let _ = stderr.read_to_string(&mut buffer);
-            buffer
-        })
-    });
-
-    // 轮询等待：每 50ms 检查一次取消令牌，支持运行中取消。
-    let status = loop {
-        if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("转换已取消".to_string());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(error) => return Err(format!("等待 ffmpeg 退出失败：{error}")),
-        }
-    };
-    let stderr = stderr_thread
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-
-    if status.success() {
+    // 10 分钟超时、60 秒无输出视为停滞；两者都支持中途取消。
+    let outcome = process::run(
+        ffmpeg,
+        &args,
+        Duration::from_secs(600),
+        Duration::from_secs(60),
+        cancel,
+    )?;
+    if outcome.status.success() {
         Ok(output)
     } else {
-        let chars: Vec<char> = stderr.chars().collect();
+        let chars: Vec<char> = outcome.stderr.chars().collect();
         let tail: String = chars[chars.len().saturating_sub(400)..].iter().collect();
-        Err(format!("转换失败（退出码：{:?}）：{}", status.code(), tail.trim()))
+        Err(format!("转换失败（退出码：{:?}）：{}", outcome.status.code(), tail.trim()))
     }
 }
 
@@ -149,9 +144,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ffmpeg_edges_cover_the_previous_whitelist() {
-        let targets: Vec<&str> = EDGES.iter().map(|edge| edge.to).collect();
-        assert_eq!(targets, vec!["mp3", "wav", "mp4", "gif", "webp"]);
-        assert!(EDGES.iter().all(|edge| edge.from == ANY_FORMAT));
+    fn edges_cover_video_audio_and_extraction() {
+        let has = |from: &str, to: &str| EDGES.iter().any(|e| e.from == from && e.to == to);
+        assert!(has("mp4", "png"), "视频抽帧是多跳的第一跳");
+        assert!(has("mov", "wav"), "视频转音频");
+        assert!(has("flac", "mp3"), "音频互转");
+        assert!(has("png", "gif"), "图片转动图");
+        assert!(EDGES.len() > 30);
     }
 }

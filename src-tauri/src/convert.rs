@@ -11,7 +11,7 @@ use orbit_core::{ConvertJobState, ConvertJobStatus, ConvertPlan, ConvertPlanStep
 use tauri::{AppHandle, Manager};
 
 use crate::conversion::{
-    ConversionStep, ConvertJob, ConverterRegistry, JobAllocator, JobRegistry, RoutePlanner,
+    ConversionStep, ConvertJob, ConverterRegistry, JobAllocator, JobRegistry, RoutePlanner, formats,
 };
 use crate::recording::resolve_ffmpeg;
 
@@ -34,7 +34,12 @@ pub(crate) async fn convert_format_impl(
 pub(crate) fn convert_formats_impl() -> Result<Vec<String>, String> {
     let registry = ConverterRegistry::global();
     let planner = RoutePlanner::new(registry.all());
-    Ok(planner.targets())
+    let reachable: std::collections::HashSet<String> = planner.targets().into_iter().collect();
+    // 圆盘只展示常用且确实可到达的目标；tiff/bmp/tga 等仍可由 convert.plan 规划。
+    Ok(formats::common_targets()
+        .into_iter()
+        .filter(|format| reachable.contains(format))
+        .collect())
 }
 
 /// 命令 `convert.plan`：只读预览路由，不创建或修改任何文件。
@@ -259,17 +264,27 @@ fn execute_conversion(
 
 /// 从输入路径推断源格式；无扩展名时无法规划，显式报错而不是猜。
 fn source_format(path: &str) -> Result<String, String> {
-    PathBuf::from(path)
+    let path_buf = PathBuf::from(path);
+    let extension = path_buf
         .extension()
         .and_then(|extension| extension.to_str())
-        .filter(|extension| !extension.is_empty())
-        .map(|extension| extension.to_ascii_lowercase())
-        .ok_or_else(|| "无法从输入路径推断源格式，请保留文件扩展名。".to_string())
+        .ok_or_else(|| "无法从输入路径推断源格式，请保留文件扩展名。".to_string())?;
+    formats::normalize(extension)
+        .map(|id| id.to_string())
+        .ok_or_else(|| format!("不支持的源格式：.{extension}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_formats_are_reachable_and_bounded() {
+        let formats = convert_formats_impl().unwrap();
+        assert!(formats.contains(&"png".to_string()));
+        assert!(formats.contains(&"mp3".to_string()));
+        assert!(formats.len() <= 12, "圆盘扇区数量必须可控");
+    }
 
     #[test]
     fn source_format_requires_an_extension() {

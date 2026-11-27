@@ -1,4 +1,4 @@
-# 格式转换框架（P0）
+# 格式转换框架
 
 Orbit 的格式转换不再是一张硬编码的格式白名单：引擎只声明**直接转换能力**，
 多跳路由由 `RoutePlanner` 在格式图上用 Dijkstra 自动推导。这个设计借鉴了
@@ -8,19 +8,23 @@ Filee 的转换子系统（引擎 → 边 → 路由 → 队列）。
 
 ```
 src-tauri/src/conversion/
+  formats.rs             格式注册表：id / 分类 / 扩展名别名 / 常用度
   model.rs               ConversionEdge / Converter / ConversionStep / ConverterStatus
-  engine/ffmpeg.rs        FFmpeg 引擎：5 个目标格式各一条边
+  engine/ffmpeg.rs        FFmpeg 引擎：视频抽帧、音视频转码、图片转动图（真实编码参数）
+  engine/image.rs         Rust image 引擎：png/jpg/webp/bmp/tiff/tga/gif 互转
   registry.rs             ConverterRegistry：能力发现唯一入口
-  planner.rs              RoutePlanner：最短路 + 独占边过滤 + 3 跳上限
+  planner.rs              RoutePlanner：Dijkstra 最短路 + 独占边过滤 + 3 跳上限
   output.rs               JobAllocator：路径预占 + 归属标记 + 失败回滚 + 工作目录
-src-tauri/src/convert.rs  命令总线门面：formats / plan / format
+  process.rs              外部进程运行器：超时 + 停滞检测 + 取消 + 进程树清理
+  job.rs                  异步任务状态 / 取消令牌 / 任务注册表
+src-tauri/src/convert.rs  命令总线门面：formats / plan / format / start / cancel / status
 ```
 
 ## 命令
 
 | 命令 | 风险 | 说明 |
 |---|---|---|
-| `convert.formats` | ReadOnly | 列出引擎声明的所有目标格式；可被 MCP 安全暴露 |
+| `convert.formats` | ReadOnly | 列出「常用且可到达」的目标格式（圆盘扇区）；可被 MCP 安全暴露 |
 | `convert.plan` | ReadOnly | 输入路径 + 目标格式 → 路由预览（`{ from, to, steps, cost }`） |
 | `convert.format` | Mutating | 同步执行，返回最终输出路径 |
 | `convert.start` | Mutating | 异步启动，立即返回任务快照（`ConvertJobStatus`） |
@@ -29,14 +33,26 @@ src-tauri/src/convert.rs  命令总线门面：formats / plan / format
 
 状态变化通过 `convert-state` 事件回流，载荷为 `ConvertJobStatus`。
 
-## 如何新增一个目标格式（P0 范围）
+## 真正的多跳路由（已实现）
 
-1. 在 `conversion/engine/ffmpeg.rs` 的 `EDGES` 加一条 `ConversionEdge::new("*", "<format>")`
-2. 在同文件的 `convert_with_ffmpeg` 参数表里加一个分支
-3. 运行 `cargo test -p orbit-core` 重新生成 TS 绑定（新增类型时）并提交
-4. 加一个纯单测验证边存在；需要真机验证的加在 `#[cfg(feature = "smoke")]`
+两个引擎的边合起来形成一张图，规划器用 Dijkstra 找最便宜路径：
 
-规划器、`convert.formats`、`convert.plan` 会自动包含新格式，无需改动。
+```text
+mp4 → png   （FFmpeg 抽帧）
+png → tiff  （image 引擎）
+----------------------------
+mp4 → tiff  = 2 跳，自动推导，没有任何引擎单独声明过这条边
+```
+
+类似还有 `mov → png → bmp`、`mp4 → png → tga`。`convert.plan` 可直接预览这些路由。
+新增一个引擎就能自动解锁一片新格式对——这是 Filee 设计的核心价值。
+
+## 格式注册表与进程健壮性（已实现）
+
+- `formats.rs` 注册 19 种格式（图片/视频/音频），支持扩展名别名（`jpeg→jpg`、`tif→tiff`、`m4v→mp4`）
+- `convert.formats` 只返回常用且可到达的目标，保证圆盘扇区数量可控；其余格式仍可规划
+- `ProcessRunner` 给 FFmpeg 加 10 分钟超时 + 60 秒停滞检测 + 取消令牌 + 进程树 kill，卡住不会拖垮任务
+- FFmpeg 输出按格式走真实编码参数（`libmp3lame` / `pcm_s16le` / `flac` / `libx264` / `fps` 滤镜等），不是改后缀
 
 ## 输出安全（P1 已实现）
 
@@ -67,7 +83,8 @@ src-tauri/src/convert.rs  命令总线门面：formats / plan / format
 
 ## 后续阶段（未实现）
 
-- P3：引擎状态缓存与后台探测、每引擎并发闸门、`ProcessRunner` 超时与停滞检测；更多引擎（PDFium / ImageMagick 等）与中间格式路由自动解锁
+- 引擎状态缓存与后台探测、每引擎并发闸门（当前 `GetStatus` 是即时探测）
+- 更多引擎（PDFium / LibreOffice / Ghostscript / Tesseract）解锁文档类多跳路由
 
 参考：Filee 项目的 `docs/ADDING-A-CONVERTER.md`、`docs/ARCHITECTURE.md` 与
 `src/Filee.Core/Conversion/{IConverter,RoutePlanner,ConverterCatalog,JobQueue}.cs`。
