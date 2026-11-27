@@ -680,6 +680,53 @@ h1 { margin: 0; font-size: 17px; font-weight: 650; color: var(--star-bright); }
 .convert-option:hover:not(:disabled) { background: rgba(180, 210, 255, .2); }
 .convert-option:disabled { opacity: .5; cursor: default; }
 .convert-option.cancel { color: #9aa4c4; }
+.convert-progress {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(180, 210, 255, .16);
+}
+.convert-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #6aa8ff, #a5d8ff);
+  transition: width .18s ease-out;
+}
+.convert-progress-text {
+  margin: 0;
+  text-align: center;
+  font-size: 11px;
+  color: #c9d4f5;
+}
+
+/* 文件拖放：折叠态球与展开态圆盘都给出可放置反馈 */
+.app-shell.drop-active .orb-button,
+.app-shell.drop-active .disc,
+.app-shell.drop-active .notch-button,
+.app-shell.drop-active .edge-button {
+  filter: drop-shadow(0 0 14px rgba(130, 195, 255, .95));
+}
+.drop-hint {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 12;
+  pointer-events: none;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(3, 3, 10, .88);
+  border: 1px solid rgba(180, 210, 255, .55);
+  color: #dfe7ff;
+  font-size: 11px;
+  white-space: nowrap;
+}
+:root[data-theme="orbit-white"] .drop-hint {
+  background: rgba(255, 255, 255, .92);
+  border-color: rgba(0, 0, 0, .2);
+  color: #222;
+}
 
 /* 设置页：在展开窗口内替换圆盘 */
 .settings-panel {

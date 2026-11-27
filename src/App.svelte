@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import type { ConvertJobStatus } from '../crates/orbit-core/bindings/ConvertJobStatus';
   import type { BindingEvent } from '../crates/orbit-core/bindings/BindingEvent';
   import type { Modifier } from '../crates/orbit-core/bindings/Modifier';
   import type { DashInfo } from '../crates/orbit-core/bindings/DashInfo';
@@ -61,13 +62,21 @@
   let flashIndex = -1;
   let convertInput: string | null = null;
   let convertBusy = false;
-  const CONVERT_FORMATS = [
-    { id: 'mp3', label: 'MP3 音频' },
-    { id: 'wav', label: 'WAV 音频' },
-    { id: 'mp4', label: 'MP4 视频' },
-    { id: 'gif', label: 'GIF 动图' },
-    { id: 'webp', label: 'WebP 动图' },
-  ];
+  // 文件拖到悬浮球/圆盘时高亮提示，松手后进入与「选文件」相同的转换流程。
+  let dropActive = false;
+  // 目标格式由后端引擎声明（convert.formats），前端不再硬编码白名单。
+  let convertFormats: string[] = [];
+  let convertJob: ConvertJobStatus | null = null;
+  const CONVERT_LABELS: Record<string, string> = {
+    mp3: 'MP3 音频',
+    wav: 'WAV 音频',
+    mp4: 'MP4 视频',
+    gif: 'GIF 动图',
+    webp: 'WebP 动图',
+  };
+  function convertLabel(format: string): string {
+    return CONVERT_LABELS[format] ?? `${format.toUpperCase()} 文件`;
+  }
 
   // 光标视差：把球内光标相对偏移传给 galaxy
   function handleOrbParallax(event: MouseEvent): void {
@@ -118,6 +127,7 @@
     id: string;
     icon: string;
     label: string;
+    title?: string;
     handler: () => void | Promise<void>;
   }
   const actions: DiscAction[] = [
@@ -127,7 +137,7 @@
     { id: 'clipboard', icon: '📋', label: '剪贴板', handler: showClipHistory },
     { id: 'ocr', icon: '🔍', label: 'OCR', handler: runOcr },
     { id: 'input', icon: '🎮', label: '键鼠录制', handler: toggleKbRecord },
-    { id: 'format', icon: '🔄', label: '格式转换', handler: runConvert },
+    { id: 'format', icon: '🔄', label: '格式转换', title: '点击选择文件，或直接把文件拖到悬浮球/圆盘', handler: runConvert },
     { id: 'mcp', icon: '🔌', label: 'MCP 工具', handler: showMcp },
     { id: 'theme', icon: '🎨', label: '主题', handler: cycleTheme },
     { id: 'monitor', icon: '📊', label: '系统监控', handler: showSystemMonitor },
@@ -473,15 +483,40 @@
     }
   }
 
+  /** 选文件与拖放共用：拿到输入路径后展开圆盘并拉取目标格式。 */
+  async function prepareConvert(input: string, prefix = ''): Promise<void> {
+    convertJob = null;
+    convertInput = input;
+    if (!panelOpen) await setPanelOpen(true);
+    notice = `${prefix}🔄 正在读取可用格式…`;
+    try {
+      convertFormats = await runCommand<string[]>('convert.formats');
+      notice = `${prefix}🔄 选择目标格式`;
+    } catch (formatError) {
+      // 后端不可用时退回已知格式，保证基础转换仍可用
+      convertFormats = Object.keys(CONVERT_LABELS);
+      notice = `${prefix}读取格式失败，使用内置列表：${String(formatError)}`;
+    }
+  }
+
   async function runConvert() {
+    if (convertBusy) { notice = '当前有转换任务，请等待完成或先取消。'; return; }
     if (!desktopBridgeAvailable) { notice = '请在桌面端使用。'; return; }
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const input = await open({ title: '选择要转换的文件', multiple: false });
       if (!input || typeof input !== 'string') { notice = '已取消'; return; }
-      convertInput = input;
-      notice = '🔄 选择目标格式';
+      await prepareConvert(input);
     } catch (e) { notice = `选择文件失败：${String(e)}`; }
+  }
+
+  /** Tauri 原生文件拖放：一次只处理一个文件，多个时明确告知取第一个。 */
+  function handleFileDrop(paths: string[]): void {
+    if (convertBusy) { notice = '当前有转换任务，请等待完成或先取消。'; return; }
+    if (paths.length === 0) return;
+    const input = paths[0];
+    const prefix = paths.length > 1 ? '一次仅转换一个文件，已取第一个。' : '';
+    void prepareConvert(input, prefix);
   }
 
   async function chooseConvertFormat(format: string) {
@@ -496,23 +531,55 @@
       if (!outPath) return;
       convertBusy = true;
       notice = `🔄 正在转换为 ${format.toUpperCase()}…`;
-      const result = await runCommand<string>('convert.format', {
+      // 异步启动：后续进度与结果由 convert-state 事件回流，不阻塞 UI。
+      const status = await runCommand<ConvertJobStatus>('convert.start', {
         inputPath: input,
         outputPath: outPath,
         format,
       });
-      notice = `✅ 转换完成：${result}`;
-      convertInput = null;
+      convertJob = status;
+      // 事件可能早于 start 的响应到达；回查一次状态，避免漏掉极快完成的任务。
+      try {
+        handleConvertState(await runCommand<ConvertJobStatus>('convert.status', { jobId: status.jobId }));
+      } catch {
+        // 任务已结束且注册表清理过，忽略即可。
+      }
     } catch (e) {
-      notice = `转换失败：${String(e)}`;
-    } finally {
+      notice = `启动转换失败：${String(e)}`;
       convertBusy = false;
     }
   }
 
-  function cancelConvert() {
+  async function cancelConvert() {
+    const jobId = convertJob?.jobId;
+    if (jobId) {
+      try {
+        await runCommand('convert.cancel', { jobId });
+        notice = '🛑 已请求取消转换';
+      } catch (e) {
+        notice = `取消失败：${String(e)}`;
+      }
+    } else {
+      convertInput = null;
+      notice = '已取消转换';
+    }
+  }
+
+  /** convert-state 事件：只接受当前任务，终态时收起面板并提示结果。 */
+  function handleConvertState(status: ConvertJobStatus): void {
+    if (!convertJob || status.jobId !== convertJob.jobId) return;
+    convertJob = status;
+    const done = status.state === 'completed' || status.state === 'completed_with_errors'
+      || status.state === 'failed' || status.state === 'cancelled';
+    if (!done) {
+      notice = `🔄 转换中 ${Math.round(status.progress * 100)}%`;
+      return;
+    }
+    convertBusy = false;
     convertInput = null;
-    notice = '已取消转换';
+    if (status.state === 'cancelled') notice = '已取消转换';
+    else if (status.error) notice = `转换失败：${status.error}`;
+    else notice = `✅ 转换完成：${status.outputPath ?? ''}`;
   }
 
   function showMcp() {
@@ -642,6 +709,17 @@
       }),
       listen<KbRecordStateEvent>('kb-record-state', ({ payload }) => {
         handleKbRecordState(payload);
+      }),
+      listen<ConvertJobStatus>('convert-state', ({ payload }) => {
+        handleConvertState(payload);
+      }),
+      getCurrentWindow().onDragDropEvent(({ payload }) => {
+        if (payload.type === 'enter' || payload.type === 'over') dropActive = true;
+        else if (payload.type === 'leave') dropActive = false;
+        else if (payload.type === 'drop') {
+          dropActive = false;
+          handleFileDrop(payload.paths);
+        }
       }),
       listen<RemoteStatus>('remote://state', ({ payload }) => {
         remoteStatus = payload;
@@ -1386,9 +1464,13 @@
   class:top-docked={dockPosition === 'top'}
   class:left-docked={dockPosition === 'left'}
   class:right-docked={dockPosition === 'right'}
+  class:drop-active={dropActive}
   class="app-shell"
   style:--orb-size={`${viewBallRadius * 2}px`}
 >
+  {#if dropActive}
+    <div class="drop-hint" aria-hidden="true">松手转换</div>
+  {/if}
   {#if remoteStatus.running}
     <div class="remote-badge" title={`远程只读服务运行中：${remoteStatus.endpoint ?? ''}`} aria-label="远程只读服务运行中">R</div>
   {/if}
@@ -1465,6 +1547,7 @@
           }}
         >
           <path class="seg-fill" d={sectorPath(viewRIn, viewROut, a0, a1)} />
+          <title>{a.title ?? a.label}</title>
           <text
             class="seg-label"
             x={tx}
@@ -1588,22 +1671,36 @@
         </div>
       {/if}
     {:else if convertInput}
-      <div class="convert-picker" role="dialog" aria-label="选择转换目标格式">
-        <p class="convert-title">转换为…</p>
-        {#each CONVERT_FORMATS as f}
+      <div class="convert-picker" role="dialog" aria-label="格式转换">
+        {#if convertJob && (convertJob.state === 'queued' || convertJob.state === 'running')}
+          <p class="convert-title">正在转换为 {convertJob.to.toUpperCase()}…</p>
+          <div
+            class="convert-progress"
+            role="progressbar"
+            aria-valuenow={Math.round(convertJob.progress * 100)}
+            aria-valuemin="0"
+            aria-valuemax="100"
+          >
+            <div class="convert-progress-fill" style="width: {Math.round(convertJob.progress * 100)}%"></div>
+          </div>
+          <p class="convert-progress-text">{Math.round(convertJob.progress * 100)}%</p>
+          <button type="button" class="convert-option cancel" onclick={() => void cancelConvert()}>取消</button>
+        {:else}
+          <p class="convert-title">转换为…</p>
+          {#each convertFormats as format}
+            <button
+              type="button"
+              class="convert-option"
+              disabled={convertBusy}
+              onclick={() => void chooseConvertFormat(format)}
+            >{convertLabel(format)}</button>
+          {/each}
           <button
             type="button"
-            class="convert-option"
-            disabled={convertBusy}
-            onclick={() => void chooseConvertFormat(f.id)}
-          >{f.label}</button>
-        {/each}
-        <button
-          type="button"
-          class="convert-option cancel"
-          disabled={convertBusy}
-          onclick={cancelConvert}
-        >取消</button>
+            class="convert-option cancel"
+            onclick={() => void cancelConvert()}
+          >取消</button>
+        {/if}
       </div>
     {/if}
     {#if monitorOpen}

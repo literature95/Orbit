@@ -12,7 +12,8 @@ use crate::{
 };
 use orbit_core::{
     AuditLog, CommandRequest, CommandResponse, CommandSpec, CommandStatus, DashInfo, EmptyParams, ClipFlagParams, ClipIdParams, ClipListParams, ClipMonitorParams, ClipWriteParams,
-    ConvertFormatParams, EventBindingKeyParams, InputMouseParams, MonitorSnapshot, OcrImageParams,
+    ConvertFormatParams, ConvertJobParams, ConvertPlanParams, ConvertStartParams, EventBindingKeyParams,
+    InputMouseParams, MonitorSnapshot, OcrImageParams,
     OrbitError, OverlaySnapshot, RecordStartParams, RegionFinishParams, RemoteRequestParams, RemoteStartParams,
     RemoveShortcutParams, ScreenshotRequest, SetAutostartParams, SetBallRadiusParams,
     SetElevatedParams, SetOverlayOpenParams, SystemInfo, UpsertEventBindingParams,
@@ -710,6 +711,75 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
                                 .await?;
                         serde_json::to_value(output).map_err(|error| OrbitError::system(error.to_string()))
                     })
+                }),
+            },
+        );
+
+        map.insert(
+            "convert.formats",
+            BusCommand {
+                spec: catalog_spec(&catalog, "convert.formats"),
+                run: sync(|_ctx, params| {
+                    let _: EmptyParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::convert_formats_impl()
+                }),
+            },
+        );
+
+        map.insert(
+            "convert.plan",
+            BusCommand {
+                spec: catalog_spec(&catalog, "convert.plan"),
+                run: sync(|_ctx, params| {
+                    let params: ConvertPlanParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::convert_plan_impl(params.input_path, params.format)
+                }),
+            },
+        );
+
+        map.insert(
+            "convert.start",
+            BusCommand {
+                spec: catalog_spec(&catalog, "convert.start"),
+                run: Arc::new(|ctx, params| {
+                    Box::pin(async move {
+                        let params: ConvertStartParams = serde_json::from_value(params)
+                            .map_err(|error| format!("参数不合法：{error}"))?;
+                        let status = crate::convert_start_impl(
+                            &ctx.app,
+                            params.input_path,
+                            params.output_path,
+                            params.format,
+                        )?;
+                        serde_json::to_value(status)
+                            .map_err(|error| OrbitError::system(error.to_string()))
+                    })
+                }),
+            },
+        );
+
+        map.insert(
+            "convert.cancel",
+            BusCommand {
+                spec: catalog_spec(&catalog, "convert.cancel"),
+                run: sync(|_ctx, params| {
+                    let params: ConvertJobParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::convert_cancel_impl(params.job_id)
+                }),
+            },
+        );
+
+        map.insert(
+            "convert.status",
+            BusCommand {
+                spec: catalog_spec(&catalog, "convert.status"),
+                run: sync(|_ctx, params| {
+                    let params: ConvertJobParams = serde_json::from_value(params)
+                        .map_err(|error| format!("参数不合法：{error}"))?;
+                    crate::convert_status_impl(params.job_id)
                 }),
             },
         );

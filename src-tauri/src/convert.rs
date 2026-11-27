@@ -1,81 +1,280 @@
-//! 格式转换：FFmpeg 转码命令封装。
+//! 格式转换：命令总线门面。
 //!
-//! 从 lib.rs 按主题拆出（纯移动，不改行为）。
+//! 框架在 `conversion/`：引擎只声明直接边，`RoutePlanner` 用 Dijkstra 推导路由，
+//! `JobAllocator` 负责输出预占与回滚，`ConvertJob` 承载异步状态与取消令牌。
+//! 本文件只负责命令编排：formats / plan / format / start / cancel / status。
 
-use tauri::AppHandle;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::NoWindow;
+use orbit_core::{ConvertJobState, ConvertJobStatus, ConvertPlan, ConvertPlanStep};
+use tauri::{AppHandle, Manager};
+
+use crate::conversion::{
+    ConversionStep, ConvertJob, ConverterRegistry, JobAllocator, JobRegistry, RoutePlanner,
+};
 use crate::recording::resolve_ffmpeg;
 
-const CONVERT_FORMATS: &[&str] = &["mp3", "wav", "mp4", "gif", "webp"];
-
+/// 命令 `convert.format`：同步执行，返回最终输出路径。
 pub(crate) async fn convert_format_impl(
     app: &AppHandle,
     input_path: String,
     output_path: String,
     format: String,
 ) -> Result<String, String> {
-    if !CONVERT_FORMATS.contains(&format.as_str()) {
-        return Err(format!(
-            "不支持的目标格式：{format}（支持：{}）",
-            CONVERT_FORMATS.join(" / ")
-        ));
-    }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let ffmpeg = resolve_ffmpeg(&app);
-        convert_with_ffmpeg(&ffmpeg, &input_path, &output_path, &format)
+        execute_conversion(&app, &input_path, &output_path, &format, None)
     })
     .await
     .map_err(|error| format!("转换工作线程异常退出：{error}"))?
 }
 
-/// 实际执行转换；与测试共用，便于单独验证 ffmpeg 参数与输出路径。
-fn convert_with_ffmpeg(
-    ffmpeg: &std::path::Path,
+/// 命令 `convert.formats`：由引擎声明的边推导出的目标格式集合。
+pub(crate) fn convert_formats_impl() -> Result<Vec<String>, String> {
+    let registry = ConverterRegistry::global();
+    let planner = RoutePlanner::new(registry.all());
+    Ok(planner.targets())
+}
+
+/// 命令 `convert.plan`：只读预览路由，不创建或修改任何文件。
+pub(crate) fn convert_plan_impl(input_path: String, format: String) -> Result<ConvertPlan, String> {
+    let from = source_format(&input_path)?;
+    let registry = ConverterRegistry::global();
+    let planner = RoutePlanner::new(registry.all());
+    let route = planner
+        .plan(&from, &format)
+        .ok_or_else(|| unsupported(&from, &format, &planner))?;
+    Ok(ConvertPlan {
+        from,
+        to: format.to_ascii_lowercase(),
+        steps: route
+            .steps
+            .into_iter()
+            .map(|step| ConvertPlanStep {
+                converter_id: step.converter_id.to_string(),
+                from: step.from,
+                to: step.to,
+            })
+            .collect(),
+        cost: route.cost,
+    })
+}
+
+/// 命令 `convert.start`：先同步校验参数与路由，再后台执行，立即返回任务快照。
+pub(crate) fn convert_start_impl(
+    app: &AppHandle,
+    input_path: String,
+    output_path: String,
+    format: String,
+) -> Result<ConvertJobStatus, String> {
+    let from = source_format(&input_path)?;
+    let registry = ConverterRegistry::global();
+    let planner = RoutePlanner::new(registry.all());
+    if planner.plan(&from, &format).is_none() {
+        return Err(unsupported(&from, &format, &planner));
+    }
+
+    let job = Arc::new(ConvertJob::new(generate_job_id(), input_path.clone(), format.clone()));
+    let status = job.snapshot();
+    JobRegistry::global().add(job.clone());
+
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = execute_conversion(&app, &input_path, &output_path, &format, Some(&job));
+    });
+    Ok(status)
+}
+
+/// 命令 `convert.cancel`：置取消令牌，后台任务在下一处检查点停下并回滚。
+pub(crate) fn convert_cancel_impl(job_id: String) -> Result<(), String> {
+    let job = JobRegistry::global()
+        .get(&job_id)
+        .ok_or_else(|| format!("转换任务不存在：{job_id}"))?;
+    job.cancel.cancel();
+    Ok(())
+}
+
+/// 命令 `convert.status`：查询任务当前状态。
+pub(crate) fn convert_status_impl(job_id: String) -> Result<ConvertJobStatus, String> {
+    JobRegistry::global()
+        .status(&job_id)
+        .ok_or_else(|| format!("转换任务不存在：{job_id}"))
+}
+
+fn unsupported(from: &str, to: &str, planner: &RoutePlanner<'_>) -> String {
+    format!(
+        "不支持的转换：{from} → {}（支持：{}）",
+        to.to_ascii_lowercase(),
+        planner.targets().join(" / ")
+    )
+}
+
+/// 任何阶段的失败都要把任务推进到终态，避免前端一直等到 Queued/Running。
+fn finish_failure(app: &AppHandle, job: Option<&ConvertJob>, error: &str) {
+    if let Some(job) = job {
+        let cancelled = job.cancel.is_cancelled();
+        job.update(|status| {
+            status.state = if cancelled {
+                ConvertJobState::Cancelled
+            } else {
+                ConvertJobState::Failed
+            };
+            status.error = Some(error.to_string());
+            status.progress = 1.0;
+        });
+        job.notify(app);
+    }
+}
+
+fn generate_job_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+fn execute_conversion(
+    app: &AppHandle,
     input_path: &str,
     output_path: &str,
     format: &str,
+    job: Option<&ConvertJob>,
 ) -> Result<String, String> {
-    let mut output = output_path.to_string();
-    if !output.to_lowercase().ends_with(&format!(".{format}")) {
-        output = format!("{}.{}", output.trim_end_matches('.'), format);
-    }
-    let out_path = std::path::Path::new(&output);
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    if let Some(job) = job {
+        job.update(|status| {
+            status.state = ConvertJobState::Running;
+            status.progress = 0.02;
+        });
+        job.notify(app);
     }
 
-    let args: Vec<&str> = match format {
-        "mp3" => vec!["-y", "-i", input_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", &output],
-        "wav" => vec!["-y", "-i", input_path, "-vn", "-acodec", "pcm_s16le", &output],
-        "mp4" => vec!["-y", "-i", input_path, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", &output],
-        "gif" => vec!["-y", "-i", input_path, "-vf", "fps=12,scale=480:-1", &output],
-        "webp" => vec!["-y", "-i", input_path, "-vf", "fps=15", "-loop", "0", &output],
-        _ => vec!["-y", "-i", input_path, &output],
+    let from = match source_format(input_path) {
+        Ok(from) => from,
+        Err(error) => {
+            finish_failure(app, job, &error);
+            return Err(error);
+        }
     };
+    let registry = ConverterRegistry::global();
+    let planner = RoutePlanner::new(registry.all());
+    let route = match planner.plan(&from, format) {
+        Some(route) if !route.steps.is_empty() => route,
+        _ => {
+            let error = unsupported(&from, format, &planner);
+            finish_failure(app, job, &error);
+            return Err(error);
+        }
+    };
+    if let Some(job) = job {
+        job.update(|status| {
+            status.from = from.clone();
+            status.to = format.to_ascii_lowercase();
+            status.progress = 0.1;
+        });
+        job.notify(app);
+    }
 
-    let converted = std::process::Command::new(ffmpeg)
-        .no_window()
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                "找不到 ffmpeg。请安装 ffmpeg 并加入 PATH，或设置 FFMPEG_PATH 环境变量。".to_string()
-            } else {
-                format!("FFmpeg 启动失败：{}", e)
+    // 任务私有工作目录：中间文件只落在这里，结束（成功或失败）都会清理。
+    let work_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))?
+        .join("convert")
+        .join(generate_job_id());
+    let mut allocator = JobAllocator::new(work_dir);
+
+    let ffmpeg = resolve_ffmpeg(app);
+    let cancel = job.map(|job| job.cancel.clone()).unwrap_or_default();
+    let mut current = PathBuf::from(input_path);
+
+    let result = (|| -> Result<PathBuf, String> {
+        let last = route.steps.len() - 1;
+        for (index, step) in route.steps.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err("转换已取消".to_string());
             }
-        })?;
+            if let Some(job) = job {
+                let progress = 0.1 + 0.8 * (index as f32 / route.steps.len() as f32);
+                job.update(|status| status.progress = progress);
+                job.notify(app);
+            }
+            let output = if index == last {
+                allocator.final_output(Path::new(output_path), &step.to)?
+            } else {
+                allocator.temp_output(&step.to)?
+            };
+            let converter = registry
+                .by_id(step.converter_id)
+                .ok_or_else(|| format!("转换引擎未注册：{}", step.converter_id))?;
+            converter.convert(
+                &ConversionStep {
+                    input_path: current.clone(),
+                    output_path: output.clone(),
+                    from: step.from.clone(),
+                    to: step.to.clone(),
+                    tool_path: ffmpeg.clone(),
+                    cancel: cancel.clone(),
+                },
+                &|_| {},
+            )?;
+            current = output;
+        }
+        Ok(current)
+    })();
 
-    if converted.status.success() {
-        Ok(output)
-    } else {
-        let stderr = String::from_utf8_lossy(&converted.stderr);
-        let chars: Vec<char> = stderr.chars().collect();
-        let tail: String = chars[chars.len().saturating_sub(400)..].iter().collect();
-        Err(format!("转换失败（退出码：{:?}）：{}", converted.status.code(), tail.trim()))
+    // 成功保留输出；失败/取消只回滚本次独占的路径，不碰用户已有文件。
+    match result {
+        Ok(path) => {
+            let output = path.to_string_lossy().into_owned();
+            allocator.finish();
+            if let Some(job) = job {
+                let cancelled = job.cancel.is_cancelled();
+                job.update(|status| {
+                    status.state = if cancelled {
+                        ConvertJobState::Cancelled
+                    } else {
+                        ConvertJobState::Completed
+                    };
+                    status.progress = 1.0;
+                    if !cancelled {
+                        status.output_path = Some(output.clone());
+                    }
+                });
+                job.notify(app);
+            }
+            Ok(output)
+        }
+        Err(error) => {
+            allocator.discard();
+            finish_failure(app, job, &error);
+            Err(error)
+        }
+    }
+}
+
+/// 从输入路径推断源格式；无扩展名时无法规划，显式报错而不是猜。
+fn source_format(path: &str) -> Result<String, String> {
+    PathBuf::from(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| extension.to_ascii_lowercase())
+        .ok_or_else(|| "无法从输入路径推断源格式，请保留文件扩展名。".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_format_requires_an_extension() {
+        assert_eq!(source_format("C:\\tmp\\a.MP4").unwrap(), "mp4");
+        assert!(source_format("C:\\tmp\\no_extension").is_err());
     }
 }
 
@@ -83,6 +282,7 @@ fn convert_with_ffmpeg(
 #[cfg(all(test, feature = "smoke"))]
 mod smoke {
     use super::*;
+    use crate::conversion::engine::ffmpeg::convert_with_ffmpeg;
 
     fn ffmpeg_available() -> bool {
         std::process::Command::new("ffmpeg")
@@ -125,6 +325,7 @@ mod smoke {
             &input.to_string_lossy(),
             &temp_path("convert-smoke").to_string_lossy(),
             "mp3",
+            &crate::conversion::CancelToken::default(),
         )
         .expect("转换失败");
         assert!(output.ends_with(".mp3"), "输出扩展名不正确：{output}");

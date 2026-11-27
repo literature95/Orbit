@@ -451,6 +451,85 @@ pub struct ConvertFormatParams {
     pub format: String,
 }
 
+/// 转换规划请求：源文件路径 + 目标格式（只读，不执行转换）。
+#[derive(Clone, Debug, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ConvertPlanParams {
+    pub input_path: String,
+    pub format: String,
+}
+
+/// 路由中的一跳：哪个引擎、从什么格式到什么格式。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConvertPlanStep {
+    pub converter_id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// 规划结果：由引擎声明的直接边经最短路推导得到。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConvertPlan {
+    pub from: String,
+    pub to: String,
+    pub steps: Vec<ConvertPlanStep>,
+    pub cost: u32,
+}
+
+/// 异步转换任务的生命周期状态。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ConvertJobState {
+    Queued,
+    Running,
+    Completed,
+    CompletedWithErrors,
+    Failed,
+    Cancelled,
+}
+
+/// 异步转换启动参数。
+#[derive(Clone, Debug, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ConvertStartParams {
+    pub input_path: String,
+    pub output_path: String,
+    pub format: String,
+}
+
+/// 按任务 id 查询或取消。
+#[derive(Clone, Debug, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ConvertJobParams {
+    pub job_id: String,
+}
+
+/// 任务快照：`convert.status` 的返回，也是 `convert-state` 事件的载荷。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConvertJobStatus {
+    pub job_id: String,
+    pub state: ConvertJobState,
+    /// 0..1；按路由跳数推进，单跳任务在完成后直接到 1。
+    pub progress: f32,
+    pub from: String,
+    pub to: String,
+    pub output_path: Option<String>,
+    pub error: Option<String>,
+}
+
 /// 管理员增强开关；开启会触发一次 UAC 并拉起常驻 helper。
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -658,6 +737,7 @@ pub fn event_catalog() -> Result<Vec<EventSpec>, serde_json::Error> {
     let kb_record_state_payload = serde_json::to_value(schemars::schema_for!(KbRecordStateEvent))?;
     let bindings_changed_payload = serde_json::to_value(schemars::schema_for!(BindingsConfig))?;
     let remote_state_payload = serde_json::to_value(schemars::schema_for!(RemoteStatus))?;
+    let convert_status_payload = serde_json::to_value(schemars::schema_for!(ConvertJobStatus))?;
     let null_payload = serde_json::json!({ "type": "null" });
     Ok(vec![
         EventSpec {
@@ -695,6 +775,11 @@ pub fn event_catalog() -> Result<Vec<EventSpec>, serde_json::Error> {
             label: "远程只读服务状态变化",
             payload_schema: remote_state_payload,
         },
+        EventSpec {
+            id: "convert-state",
+            label: "转换任务状态或进度变化",
+            payload_schema: convert_status_payload,
+        },
     ])
 }
 
@@ -718,6 +803,11 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let clip_monitor_params = serde_json::to_value(schemars::schema_for!(ClipMonitorParams))?;
     let ocr_image_params = serde_json::to_value(schemars::schema_for!(OcrImageParams))?;
     let convert_format_params = serde_json::to_value(schemars::schema_for!(ConvertFormatParams))?;
+    let convert_plan_params = serde_json::to_value(schemars::schema_for!(ConvertPlanParams))?;
+    let convert_plan_returns = serde_json::to_value(schemars::schema_for!(ConvertPlan))?;
+    let convert_start_params = serde_json::to_value(schemars::schema_for!(ConvertStartParams))?;
+    let convert_job_params = serde_json::to_value(schemars::schema_for!(ConvertJobParams))?;
+    let convert_status_returns = serde_json::to_value(schemars::schema_for!(ConvertJobStatus))?;
     let region_finish_params = serde_json::to_value(schemars::schema_for!(RegionFinishParams))?;
     let elevated_params = serde_json::to_value(schemars::schema_for!(SetElevatedParams))?;
     let command_response_returns = serde_json::to_value(schemars::schema_for!(CommandResponse))?;
@@ -747,6 +837,7 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let number_returns = serde_json::json!({ "type": "number" });
     let bool_returns = serde_json::json!({ "type": "boolean" });
     let null_returns = serde_json::json!({ "type": "null" });
+    let string_array_returns = serde_json::json!({ "type": "array", "items": { "type": "string" } });
     Ok(vec![
         CommandSpec {
             id: "screenshot.capture",
@@ -1109,6 +1200,51 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             idempotent: false,
         },
         CommandSpec {
+            id: "convert.formats",
+            label: "列出可转换的目标格式",
+            category: CommandCategory::Convert,
+            risk: RiskLevel::ReadOnly,
+            params_schema: empty_params.clone(),
+            returns_schema: string_array_returns,
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "convert.plan",
+            label: "规划转换路由（不执行）",
+            category: CommandCategory::Convert,
+            risk: RiskLevel::ReadOnly,
+            params_schema: convert_plan_params,
+            returns_schema: convert_plan_returns,
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "convert.start",
+            label: "异步启动转换任务",
+            category: CommandCategory::Convert,
+            risk: RiskLevel::Mutating,
+            params_schema: convert_start_params,
+            returns_schema: convert_status_returns.clone(),
+            idempotent: false,
+        },
+        CommandSpec {
+            id: "convert.cancel",
+            label: "取消转换任务",
+            category: CommandCategory::Convert,
+            risk: RiskLevel::Mutating,
+            params_schema: convert_job_params.clone(),
+            returns_schema: null_returns.clone(),
+            idempotent: true,
+        },
+        CommandSpec {
+            id: "convert.status",
+            label: "查询转换任务状态",
+            category: CommandCategory::Convert,
+            risk: RiskLevel::ReadOnly,
+            params_schema: convert_job_params,
+            returns_schema: convert_status_returns,
+            idempotent: true,
+        },
+        CommandSpec {
             id: "region.start",
             label: "开始区域选区",
             category: CommandCategory::Capture,
@@ -1307,6 +1443,11 @@ mod tests {
                 "kb.replay",
                 "input.mouse",
                 "convert.format",
+                "convert.formats",
+                "convert.plan",
+                "convert.start",
+                "convert.cancel",
+                "convert.status",
                 "region.start",
                 "region.finish",
                 "region.cancel",
@@ -1354,8 +1495,8 @@ mod tests {
         let catalog = command_catalog().unwrap();
         assert_eq!(
             catalog.len(),
-            56,
-            "命令目录应包含绑定层 6 条、回放 2 条、远程只读 5 条、鼠标控制 1 条与球半径 1 条命令"
+            61,
+            "命令目录应包含绑定层 6 条、回放 2 条、远程只读 5 条、鼠标控制 1 条、球半径 1 条与转换 5 条命令"
         );
         let start = catalog
             .iter()
@@ -1538,5 +1679,10 @@ mod tests {
         MouseAction::export_all(&cfg).expect("导出 MouseAction 失败");
         InputMouseParams::export_all(&cfg).expect("导出 InputMouseParams 失败");
         KbRecordStateEvent::export_all(&cfg).expect("导出 KbRecordStateEvent 失败");
+        ConvertPlanParams::export_all(&cfg).expect("导出 ConvertPlanParams 失败");
+        ConvertPlan::export_all(&cfg).expect("导出 ConvertPlan 失败");
+        ConvertStartParams::export_all(&cfg).expect("导出 ConvertStartParams 失败");
+        ConvertJobParams::export_all(&cfg).expect("导出 ConvertJobParams 失败");
+        ConvertJobStatus::export_all(&cfg).expect("导出 ConvertJobStatus 失败");
     }
 }

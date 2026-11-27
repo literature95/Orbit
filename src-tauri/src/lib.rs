@@ -12,6 +12,7 @@ use xcap::Monitor;
 mod bindings;
 mod bus;
 mod clipboard;
+mod conversion;
 mod convert;
 mod elevated;
 mod input_recorder;
@@ -28,7 +29,10 @@ mod windows;
 
 // 保持 crate 根符号不变：bus.rs 等调用点通过 `crate::...` 引用这些名字，
 // 拆分后经再导出继续生效，调用点零改动。
-pub(crate) use convert::convert_format_impl;
+pub(crate) use convert::{
+    convert_cancel_impl, convert_format_impl, convert_formats_impl, convert_plan_impl,
+    convert_start_impl, convert_status_impl,
+};
 pub(crate) use monitor::DashState;
 pub(crate) use ocr_backend::ocr_current_screen_impl;
 pub(crate) use recording::{
