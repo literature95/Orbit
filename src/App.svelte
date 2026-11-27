@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { onMount } from 'svelte';
   import type { CommandResponse } from '../crates/orbit-core/bindings/CommandResponse';
+  import type { ConvertFormatOption } from '../crates/orbit-core/bindings/ConvertFormatOption';
   import type { ConvertJobStatus } from '../crates/orbit-core/bindings/ConvertJobStatus';
   import type { BindingEvent } from '../crates/orbit-core/bindings/BindingEvent';
   import type { Modifier } from '../crates/orbit-core/bindings/Modifier';
@@ -64,19 +65,19 @@
   let convertBusy = false;
   // 拖拽文件时悬停的扇区索引；-1 表示不在任何扇区上。
   let dropHoverIndex = -1;
-  // 目标格式由后端引擎声明（convert.formats），前端不再硬编码白名单。
-  let convertFormats: string[] = [];
+  // 目标格式由后端按源文件规划（convert.formats），前端只展示返回的 id + 友好标签。
+  let convertFormats: ConvertFormatOption[] = [];
   let convertJob: ConvertJobStatus | null = null;
-  const CONVERT_LABELS: Record<string, string> = {
-    mp3: 'MP3 音频',
-    wav: 'WAV 音频',
-    mp4: 'MP4 视频',
-    gif: 'GIF 动图',
-    webp: 'WebP 动图',
-  };
-  function convertLabel(format: string): string {
-    return CONVERT_LABELS[format] ?? `${format.toUpperCase()} 文件`;
-  }
+  const FALLBACK_FORMATS: ConvertFormatOption[] = [
+    { id: 'mp3', label: 'MP3 音频' },
+    { id: 'wav', label: 'WAV 音频' },
+    { id: 'mp4', label: 'MP4 视频' },
+    { id: 'gif', label: 'GIF 动图' },
+    { id: 'webp', label: 'WebP 动图' },
+    { id: 'png', label: 'PNG 图片' },
+    { id: 'jpg', label: 'JPG 图片' },
+    { id: 'bmp', label: 'BMP 图片' },
+  ];
 
   // 光标视差：把球内光标相对偏移传给 galaxy
   function handleOrbParallax(event: MouseEvent): void {
@@ -239,13 +240,13 @@
     .filter((action): action is DiscAction => Boolean(action));
   // 格式选择态：圆盘扇区直接变成目标格式，末尾追加「取消」扇区返回主轮盘。
   $: convertActions = [
-    ...convertFormats.map((format): DiscAction => ({
-      id: `convert:${format}`,
+    ...convertFormats.map((option): DiscAction => ({
+      id: `convert:${option.id}`,
       icon: '🔄',
-      label: format.toUpperCase(),
-      title: `转换为 ${convertLabel(format)}`,
-      format,
-      handler: () => chooseConvertFormat(format),
+      label: option.label,
+      title: `转换为 ${option.label}`,
+      format: option.id,
+      handler: () => chooseConvertFormat(option.id),
     })),
     {
       id: 'convert:cancel',
@@ -509,11 +510,13 @@
     convertJob = null;
     convertInput = input;
     dropHoverIndex = -1;
-    convertFormats = Object.keys(CONVERT_LABELS);
+    convertFormats = FALLBACK_FORMATS;
     notice = '';
     if (!panelOpen) await setPanelOpen(true);
     try {
-      convertFormats = await runCommand<string[]>('convert.formats');
+      convertFormats = await runCommand<ConvertFormatOption[]>('convert.formats', {
+        sourcePath: input,
+      });
     } catch {
       // 后端不可用时保留内置列表，基础转换仍可用。
     }

@@ -12,7 +12,8 @@ use crate::{
 };
 use orbit_core::{
     AuditLog, CommandRequest, CommandResponse, CommandSpec, CommandStatus, DashInfo, EmptyParams, ClipFlagParams, ClipIdParams, ClipListParams, ClipMonitorParams, ClipWriteParams,
-    ConvertFormatParams, ConvertJobParams, ConvertPlanParams, ConvertStartParams, EventBindingKeyParams,
+    ConvertFormatParams, ConvertFormatsParams, ConvertJobParams, ConvertPlanParams, ConvertStartParams,
+    EventBindingKeyParams,
     InputMouseParams, MonitorSnapshot, OcrImageParams,
     OrbitError, OverlaySnapshot, RecordStartParams, RegionFinishParams, RemoteRequestParams, RemoteStartParams,
     RemoveShortcutParams, ScreenshotRequest, SetAutostartParams, SetBallRadiusParams,
@@ -720,9 +721,9 @@ pub fn registry() -> &'static HashMap<&'static str, BusCommand> {
             BusCommand {
                 spec: catalog_spec(&catalog, "convert.formats"),
                 run: sync(|_ctx, params| {
-                    let _: EmptyParams = serde_json::from_value(params)
+                    let params: ConvertFormatsParams = serde_json::from_value(params)
                         .map_err(|error| format!("参数不合法：{error}"))?;
-                    crate::convert_formats_impl()
+                    crate::convert_formats_impl(params.source_path)
                 }),
             },
         );

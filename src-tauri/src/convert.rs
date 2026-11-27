@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use orbit_core::{ConvertJobState, ConvertJobStatus, ConvertPlan, ConvertPlanStep};
+use orbit_core::{ConvertFormatOption, ConvertJobState, ConvertJobStatus, ConvertPlan, ConvertPlanStep};
 use tauri::{AppHandle, Manager};
 
 use crate::conversion::{
@@ -31,14 +31,25 @@ pub(crate) async fn convert_format_impl(
 }
 
 /// 命令 `convert.formats`：由引擎声明的边推导出的目标格式集合。
-pub(crate) fn convert_formats_impl() -> Result<Vec<String>, String> {
+pub(crate) fn convert_formats_impl(
+    source_path: Option<String>,
+) -> Result<Vec<ConvertFormatOption>, String> {
     let registry = ConverterRegistry::global();
     let planner = RoutePlanner::new(registry.all());
+    // 有源文件时，只返回从该格式确实能规划出路由的目标。
+    let from = source_path.as_deref().and_then(|path| source_format(path).ok());
     let reachable: std::collections::HashSet<String> = planner.targets().into_iter().collect();
     // 圆盘只展示常用且确实可到达的目标；tiff/bmp/tga 等仍可由 convert.plan 规划。
     Ok(formats::common_targets()
         .into_iter()
-        .filter(|format| reachable.contains(format))
+        .filter(|to| {
+            reachable.contains(to)
+                && from.as_deref().map_or(true, |source| planner.plan(source, to).is_some())
+        })
+        .map(|id| ConvertFormatOption {
+            label: formats::label(&id).unwrap_or(id.as_str()).to_string(),
+            id,
+        })
         .collect())
 }
 
@@ -280,10 +291,21 @@ mod tests {
 
     #[test]
     fn common_formats_are_reachable_and_bounded() {
-        let formats = convert_formats_impl().unwrap();
-        assert!(formats.contains(&"png".to_string()));
-        assert!(formats.contains(&"mp3".to_string()));
-        assert!(formats.len() <= 12, "圆盘扇区数量必须可控");
+        let options = convert_formats_impl(None).unwrap();
+        let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+        assert!(ids.contains(&"png"));
+        assert!(ids.contains(&"mp3"));
+        assert!(ids.len() <= 12, "圆盘扇区数量必须可控");
+        assert!(options.iter().all(|option| !option.label.is_empty()), "扇区需要友好标签");
+    }
+
+    #[test]
+    fn formats_are_filtered_by_source_file() {
+        let all = convert_formats_impl(None).unwrap();
+        let from_mp3 = convert_formats_impl(Some("C:\\tmp\\a.mp3".into())).unwrap();
+        assert!(from_mp3.len() < all.len());
+        assert!(from_mp3.iter().any(|option| option.id == "wav"), "音频可转 wav");
+        assert!(!from_mp3.iter().any(|option| option.id == "mp4"), "音频不能直接转视频");
     }
 
     #[test]

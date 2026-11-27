@@ -24,7 +24,7 @@ src-tauri/src/convert.rs  命令总线门面：formats / plan / format / start /
 
 | 命令 | 风险 | 说明 |
 |---|---|---|
-| `convert.formats` | ReadOnly | 列出「常用且可到达」的目标格式（圆盘扇区）；可被 MCP 安全暴露 |
+| `convert.formats` | ReadOnly | `ConvertFormatsParams { sourcePath }` → `ConvertFormatOption[]`：按源文件过滤出的可转换目标（含友好标签） |
 | `convert.plan` | ReadOnly | 输入路径 + 目标格式 → 路由预览（`{ from, to, steps, cost }`） |
 | `convert.format` | Mutating | 同步执行，返回最终输出路径 |
 | `convert.start` | Mutating | 异步启动，立即返回任务快照（`ConvertJobStatus`） |
@@ -75,7 +75,8 @@ mp4 → tiff  = 2 跳，自动推导，没有任何引擎单独声明过这条�
 
 两种方式进入同一流程：点击圆盘「格式转换」扇区选文件，或**把文件直接拖到悬浮球/圆盘**
 （Tauri 原生 `onDragDropEvent`，`dragDropEnabled` 默认开启，无需额外 capability）。
-拖入时圆盘立即切换为目标格式扇区（MP3/WAV/MP4/GIF/WebP…），末尾追加「取消」扇区；
+拖入时圆盘立即切换为目标格式扇区（显示「MP3 音频」「PNG 图片」等友好标签，而非裸后缀），
+**只列出从该文件确实能转换到的格式**，末尾追加「取消」扇区；
 **拖拽悬停到哪个扇区就高亮哪个，松手即转换到该格式或取消**，不再有「松手转换」文字提示。
 点击方式则是点格式扇区 → 选保存路径。两者都走 `convert.start` 异步启动 →
 监听 `convert-state` 显示进度/结果；点「取消」扇区或按 Esc 静默回到主轮盘。

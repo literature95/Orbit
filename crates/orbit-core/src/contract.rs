@@ -451,6 +451,25 @@ pub struct ConvertFormatParams {
     pub format: String,
 }
 
+/// 可转换目标格式（供圆盘扇区展示）。
+#[derive(Clone, Debug, JsonSchema, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConvertFormatOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// 查询可转换格式：传入源文件后只返回从该格式可到达的目标。
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ConvertFormatsParams {
+    #[serde(default)]
+    pub source_path: Option<String>,
+}
+
 /// 转换规划请求：源文件路径 + 目标格式（只读，不执行转换）。
 #[derive(Clone, Debug, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -803,6 +822,8 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let clip_monitor_params = serde_json::to_value(schemars::schema_for!(ClipMonitorParams))?;
     let ocr_image_params = serde_json::to_value(schemars::schema_for!(OcrImageParams))?;
     let convert_format_params = serde_json::to_value(schemars::schema_for!(ConvertFormatParams))?;
+    let convert_formats_params = serde_json::to_value(schemars::schema_for!(ConvertFormatsParams))?;
+    let convert_formats_returns = serde_json::to_value(schemars::schema_for!(Vec<ConvertFormatOption>))?;
     let convert_plan_params = serde_json::to_value(schemars::schema_for!(ConvertPlanParams))?;
     let convert_plan_returns = serde_json::to_value(schemars::schema_for!(ConvertPlan))?;
     let convert_start_params = serde_json::to_value(schemars::schema_for!(ConvertStartParams))?;
@@ -837,7 +858,6 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
     let number_returns = serde_json::json!({ "type": "number" });
     let bool_returns = serde_json::json!({ "type": "boolean" });
     let null_returns = serde_json::json!({ "type": "null" });
-    let string_array_returns = serde_json::json!({ "type": "array", "items": { "type": "string" } });
     Ok(vec![
         CommandSpec {
             id: "screenshot.capture",
@@ -1204,8 +1224,8 @@ pub fn command_catalog() -> Result<Vec<CommandSpec>, serde_json::Error> {
             label: "列出可转换的目标格式",
             category: CommandCategory::Convert,
             risk: RiskLevel::ReadOnly,
-            params_schema: empty_params.clone(),
-            returns_schema: string_array_returns,
+            params_schema: convert_formats_params,
+            returns_schema: convert_formats_returns,
             idempotent: true,
         },
         CommandSpec {
@@ -1679,6 +1699,8 @@ mod tests {
         MouseAction::export_all(&cfg).expect("导出 MouseAction 失败");
         InputMouseParams::export_all(&cfg).expect("导出 InputMouseParams 失败");
         KbRecordStateEvent::export_all(&cfg).expect("导出 KbRecordStateEvent 失败");
+        ConvertFormatsParams::export_all(&cfg).expect("导出 ConvertFormatsParams 失败");
+        ConvertFormatOption::export_all(&cfg).expect("导出 ConvertFormatOption 失败");
         ConvertPlanParams::export_all(&cfg).expect("导出 ConvertPlanParams 失败");
         ConvertPlan::export_all(&cfg).expect("导出 ConvertPlan 失败");
         ConvertStartParams::export_all(&cfg).expect("导出 ConvertStartParams 失败");

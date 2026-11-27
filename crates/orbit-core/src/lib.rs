@@ -16,8 +16,9 @@ pub use error::{ErrorKind, OrbitError};
 pub use contract::{
     ClipFlagParams, ClipIdParams, ClipItem, ClipListParams, ClipMonitorParams, ClipWriteParams,
     ClipboardChanged, CommandCategory, CommandRequest, CommandResponse, CommandSpec,
-    CommandStatus, ConvertFormatParams, ConvertJobParams, ConvertJobState, ConvertJobStatus,
-    ConvertPlan, ConvertPlanParams, ConvertPlanStep, ConvertStartParams, DashInfo, DockPosition,
+    CommandStatus, ConvertFormatOption, ConvertFormatParams, ConvertFormatsParams, ConvertJobParams,
+    ConvertJobState, ConvertJobStatus, ConvertPlan, ConvertPlanParams, ConvertPlanStep,
+    ConvertStartParams, DashInfo, DockPosition,
     EmptyParams, EventBindingKeyParams,
     EventSpec, KbEvent, KbReplayParams, KbReplayResult, RecordingItem, CaptureRegion,
     InputMouseParams, MouseAction, KbRecordStateEvent,
